@@ -22,6 +22,8 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/epilogue/thread/activation.h"
+#include "cutlass/epilogue/fusion/operations.hpp"
+#include "cutlass/epilogue/fusion/sm100_callbacks_tma_warpspecialized.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
 using namespace cute;
@@ -29,6 +31,28 @@ using namespace cute;
 // Type aliases
 using cutlass_fp8 = cutlass::float_e4m3_t;
 using cutlass_fp16 = cutlass::half_t;
+
+struct GeGluMulScaleArguments {
+  float const* scale_ptr = nullptr;
+};
+
+template <class T>
+struct GeGluMulScale {
+  using Arguments = GeGluMulScaleArguments;
+  CUTLASS_HOST_DEVICE
+  T operator()(T const& up, T const& gate, Arguments const& args) const {
+    T out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) {
+      float g = static_cast<float>(gate[i]);
+      float u = static_cast<float>(up[i]);
+      float inv_scale = 1.0f / fmaxf(*args.scale_ptr, 1e-12f);
+      float gelu = g / (1.0f + expf(-1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+      out[i] = gelu * u * inv_scale;
+    }
+    return out;
+  }
+};
 
 // ============================================================
 //  PlainGemm: 256×128×64, Cluster 2×2×1
@@ -134,6 +158,33 @@ using Main = typename cutlass::gemm::collective::CollectiveBuilder<
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
     cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
 }  // namespace sm100_wide
+
+// 实验：拆分 step8 Gate/Up，在 Up GEMM epilogue 融合 GELU(gate) × up 和 FP8 量化。
+namespace sm100_wide_geglu_fp8out {
+// 原配置 256x128x128；减小 M tile、增大 K tile，降低尾块浪费和 K-loop 开销。
+// using Tile = Shape<_256, _128, _128>;
+using Tile = Shape<_128, _128, _256>;
+using Cluster = Shape<_2, _2, _1>;
+using Fusion = cutlass::epilogue::fusion::LinCombDeEltAct<
+    cutlass::layout::RowMajor, GeGluMulScale,
+    cutlass_fp8, float, cutlass_fp16>;
+using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
+    float, float, cutlass_fp8, cutlass::layout::RowMajor, 16,
+    cutlass_fp8, cutlass::layout::RowMajor, 16,
+    cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass_fp8, cutlass::layout::RowMajor, 16,
+    cutlass_fp8, cutlass::layout::ColumnMajor, 16,
+    float, Tile, Cluster,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename Epi::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
+    cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
+}  // namespace sm100_wide_geglu_fp8out
 
 // ============================================================
 //  T1Gemm: 128×256×128, Cluster 2×1×1, TmaWarpSpecialized2Sm

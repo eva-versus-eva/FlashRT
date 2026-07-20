@@ -45,6 +45,28 @@ import math
 import os
 import numpy as np
 
+try:
+    import torch.cuda.nvtx as nvtx
+except Exception:
+    class _NvtxStub:
+        def range_push(self, _msg):
+            return None
+
+        def range_pop(self):
+            return None
+
+    nvtx = _NvtxStub()
+
+_fa2 = None
+
+
+def _fa2_module():
+    global _fa2
+    if _fa2 is None:
+        from flash_rt import flash_rt_fa2
+        _fa2 = flash_rt_fa2
+    return _fa2
+
 
 # ══════════════════════════════════════════════════════════════════
 # SigLIP Vision Encoder (27 layers)
@@ -466,7 +488,7 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
     logits = bufs['logits']
     attn_out = bufs['attn_out']
     o_fp8 = bufs['o_fp8']
-    gate = bufs['gate']   # [Se, 2H] for merged gate+up output
+    gate = bufs['gate']   # [Se, 2H] storage; fused path uses the first H for gate
     hid_fp8 = bufs['hid_fp8']
     fg = bufs['fg']
 
@@ -498,40 +520,85 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             kv_elem_off, HD, stream)
 
         if not last:
-            # ── 5. Attention (cuBLAS) ──
-            if attn is not None:
-                attn.run("encoder", l, q_seq=Se, stream=stream)
+            # if attn is not None:
+            #     attn.run("encoder", l, q_seq=Se, stream=stream)
+            # else:
+            #     K_ptr = weights['Kc'] + kv_elem_off * 2
+            #     V_ptr = weights['Vc'] + kv_elem_off * 2
+            #     fvk.attention_qkv_fp16(bufs['ctx'], attn_out, K_ptr, V_ptr,
+            #                             logits, attn_out,
+            #                             Se, Se, NH, HD, attn_scale, stream)
+            # 优化：exact shape 用 FA2 HD256/GQA 融合 QK、softmax、PV。
+            # fixed shape 保留新版 seqused attention，避免读取 padded K/V。
+            if attn is not None and getattr(attn, "_fixed_shape", False):
+                attn_result = attn.run(
+                    "encoder", l, q_seq=Se, stream=stream)
             else:
-                K_ptr = weights['Kc'] + kv_elem_off * 2  # byte offset (fp16)
+                K_ptr = weights['Kc'] + kv_elem_off * 2
                 V_ptr = weights['Vc'] + kv_elem_off * 2
-                fvk.attention_qkv_fp16(bufs['ctx'], attn_out, K_ptr, V_ptr,
-                                        logits, attn_out,
-                                        Se, Se, NH, HD, attn_scale, stream)
+                attn_result = logits
+                lse_ptr = logits + Se * Q_dim * 2
+                _fa2_module().fwd_fp16(
+                    Q=attn_out, K=K_ptr, V=V_ptr, O=attn_result,
+                    softmax_lse=lse_ptr, softmax_lse_accum=0, o_accum=0,
+                    batch=1, seqlen_q=Se, seqlen_k=Se,
+                    num_heads_q=NH, num_heads_kv=1, head_dim=HD,
+                    q_strides=(Se * Q_dim, Q_dim, HD),
+                    k_strides=(Se * HD, HD, HD),
+                    v_strides=(Se * HD, HD, HD),
+                    o_strides=(Se * Q_dim, Q_dim, HD),
+                    softmax_scale=attn_scale, num_sms=0, stream=stream)
 
             # ── 6. Quantize attn→FP8 with act_scale + O proj GEMM ──
-            fvk.quantize_fp8_static_fp16(attn_out, o_fp8, as_o, Se * D, stream)
-            fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
-                               Se, D, D, alpha_host[l * 4 + 1], 0.0, stream)
+            nvtx.range_push(f"step6_enc_l{l}_attn_quant_o_proj")
+            try:
+                fvk.quantize_fp8_static_fp16(attn_result, o_fp8, as_o, Se * D, stream)
+                fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
+                                   Se, D, D, alpha_host[l * 4 + 1], 0.0, stream)
+            finally:
+                nvtx.range_pop()
 
             # ── 7. Residual + RMSNorm → FP8 with act_scale (noweight) ──
-            fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
-                                                          Se, D, as_gu, stream)
+            nvtx.range_push(f"step7_enc_l{l}_res_rms_1")
+            try:
+                fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
+                                                              Se, D, as_gu, stream)
+            finally:
+                nvtx.range_pop()
 
-            # ── 8. Gate+Up merged GEMM (T1 tile for L2 optimization) ──
-            fvk.cutlass_fp8_t1(x_fp8, weights['gate_w'][l], gate,
-                               Se, H * 2, D, alpha_host[l * 4 + 2], 0.0, stream)
-
-            # ── 9. GELU(gate) × up → FP8 with act_scale ──
-            fvk.gate_geglu_merged_fp8_fp16(gate, hid_fp8, Se, H,
-                                               as_d, stream)
+            # ── 8+9. Gate/Up GEMM + GEGLU ──
+            nvtx.range_push(f"step8_enc_l{l}_ffn_gate_up")
+            try:
+                # fvk.cutlass_fp8_wide(x_fp8, weights['gate_w'][l], gate,
+                #                       Se, H * 2, D, alpha_host[l * 4 + 2], 0.0, stream)
+                # fvk.gate_geglu_merged_fp8_fp16(gate, hid_fp8, Se, H, as_d, stream)
+                # 优化：拆分 Gate/Up，在 Up GEMM epilogue 融合 GEGLU 与 FP8 量化。
+                # 消除独立 step9 kernel 和 Up FP16 中间结果读写。
+                gate_w = weights['gate_w'][l]
+                up_w = gate_w + H * D
+                fvk.cutlass_fp8_wide(x_fp8, gate_w, gate,
+                                      Se, H, D, alpha_host[l * 4 + 2], 0.0, stream)
+                fvk.cutlass_fp8_wide_geglu_fp8out(x_fp8, up_w, gate, hid_fp8,
+                                                   Se, H, D, alpha_host[l * 4 + 2],
+                                                   as_d, stream)
+            finally:
+                nvtx.range_pop()
 
             # ── 10. Down GEMM ──
-            fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
-                                  Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
+            nvtx.range_push(f"step10_enc_l{l}_ffn_down")
+            try:
+                fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
+                                      Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
+            finally:
+                nvtx.range_pop()
 
             # ── 11. Residual writeback. The next layer recomputes C1
             # RMSNorm→FP8, so no FP8 output is consumed here.
-            fvk.residual_add_fp16(x, fg, Se * D, stream)
+            nvtx.range_push(f"step11_enc_l{l}_residual_writeback")
+            try:
+                fvk.residual_add_fp16(x, fg, Se * D, stream)
+            finally:
+                nvtx.range_pop()
 
     # x[Se, D] now contains final encoder output
 

@@ -78,22 +78,17 @@ endif()
 message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 
 # Flash-Attention 2 vendor (csrc/attention/flash_attn_2_src/): ships
-# SM80-family fp16 fwd kernels. Ampere-family consumer GPUs including
-# SM86/87/89 share the same source instantiations; we emit arch-specific
-# codegen per target so Jetson Orin (SM87) is not forced through an
-# incompatible cubin. SM120 (5090) uses PTX JIT from
-# compute_80. Thor SM110 has its own attention path (fvk.attention_qkv_fp16
-# cuBLAS decomposed), hand-tuned for unified LPDDR memory — building
-# FA2 there would add ~10 MB to the .so and unused compile time.
+# SM80-family forward kernels. SM80/86/87/89 use Ampere-family codegen,
+# Thor SM110 uses compute_80 PTX JIT, and SM120/121 use native codegen.
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
-   GPU_ARCH STREQUAL "87"  OR
-   GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120" OR
+   GPU_ARCH STREQUAL "87"  OR GPU_ARCH STREQUAL "89" OR
+   GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR
    GPU_ARCH STREQUAL "121")
   set(ENABLE_FA2 ON)
   message(STATUS "FA2 in-SO attention: ENABLED (sm_${GPU_ARCH})")
 else()
   set(ENABLE_FA2 OFF)
-  message(STATUS "FA2 in-SO attention: DISABLED (Thor SM110 uses fvk.attention_qkv_fp16 cuBLAS path)")
+  message(STATUS "FA2 in-SO attention: DISABLED (unsupported GPU_ARCH=${GPU_ARCH})")
 endif()
 
 # SM80-family CUTLASS INT8 kernels used by the Jetson Orin SM87 Pi0.5 fast
@@ -839,6 +834,7 @@ if(ENABLE_FA2 AND
   # which hdim/dtype instantiations were built, so it links cleanly
   # against any subset of the matrix.
   list(APPEND FA2_SRCS csrc/attention/fa2_wrapper.cu)
+  set(FLASHRT_FA2_CAUSAL_WRAPPER_BUILT OFF)
 
   # Causal FA2 forward. hdim=128 serves Qwen3-8B prefill; hdim=256
   # serves Qwen3.6 full-attention prefill/verify chunks.
@@ -858,10 +854,12 @@ if(ENABLE_FA2 AND
     # The native C boundary has a stable five-symbol surface. Its causal
     # wrapper contains native-only fail-fast dispatch for a slim matrix.
     list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
+    set(FLASHRT_FA2_CAUSAL_WRAPPER_BUILT ON)
   elseif("bf16" IN_LIST FA2_DTYPES AND
          ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
     # Preserve the existing Python-only source matrix exactly by default.
     list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
+    set(FLASHRT_FA2_CAUSAL_WRAPPER_BUILT ON)
   endif()
 
   add_library(fa2_vendor_obj OBJECT ${FA2_SRCS})
@@ -926,7 +924,16 @@ if(ENABLE_FA2 AND
   # FA2_ARCH_NATIVE_ONLY=ON skips the non-native AOT passes, saving
   # ~66% compile time on single-card developer boxes.
   # ──────────────────────────────────────────────────────────────
-  if(FA2_ARCH_NATIVE_ONLY)
+  # Thor has no native SM110 FA2 target; always emit compute_80 PTX for driver JIT.
+  # FA2_ARCH_NATIVE_ONLY only controls architectures with native FA2 codegen.
+  if(GPU_ARCH STREQUAL "110")
+    target_compile_options(fa2_vendor_obj PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        "SHELL:-gencode arch=compute_80,code=compute_80"
+      >
+    )
+    message(STATUS "FA2 vendor arch: compute_80 PTX for SM110 JIT")
+  elseif(FA2_ARCH_NATIVE_ONLY)
     # Just emit native SASS for the detected GPU. Use the real arch
     # (compute_80 for SM80/86/89 since they share Ampere ISA; direct
     # Blackwell arch for SM120/121). Matches upstream FA2 setup.py
@@ -1033,6 +1040,10 @@ if(ENABLE_FA2 AND
     target_include_directories(flash_rt_fa2 PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     )
+    if(FLASHRT_FA2_CAUSAL_WRAPPER_BUILT)
+      target_compile_definitions(flash_rt_fa2 PRIVATE
+        FLASHRT_FA2_HAS_CAUSAL_WRAPPER=1)
+    endif()
     if(FLASHRT_ENABLE_NATIVE_CPP)
       target_compile_definitions(flash_rt_fa2 PRIVATE
         FLASHRT_FA2_NATIVE_SHARED=1)

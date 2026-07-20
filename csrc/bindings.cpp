@@ -375,6 +375,7 @@ extern "C" float launch_w4a8_gemm(void*, void*, void*, void*, void*, void*, int,
 extern "C" int cutlass_fp8_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_t1(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_wide(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp8_wide_geglu_fp8out(void*, void*, void*, void*, int, int, int, float, const float*, cudaStream_t);
 // CUTLASS FP16 variants (encoder/SigLIP FP16 path)
 extern "C" int cutlass_fp16_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1849,6 +1850,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("A"), py::arg("B"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp8_wide_geglu_fp8out", [](uintptr_t A, uintptr_t B_up, uintptr_t gate_aux, uintptr_t D,
+                                               int M, int N, int K, float alpha,
+                                               uintptr_t act_scale, uintptr_t stream) {
+        return cutlass_fp8_wide_geglu_fp8out(
+            to_ptr(A), to_ptr(B_up), to_ptr(gate_aux), to_ptr(D),
+            M, N, K, alpha, reinterpret_cast<const float*>(act_scale), to_stream(stream));
+    }, py::arg("A"), py::arg("B_up"), py::arg("gate_aux"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha"), py::arg("act_scale"), py::arg("stream") = 0);
 
     m.def("cutlass_fp8_plain", [](uintptr_t A, uintptr_t B, uintptr_t D,
                                     int M, int N, int K, float alpha, float beta, uintptr_t stream) {

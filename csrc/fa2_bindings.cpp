@@ -13,8 +13,8 @@
 //      fa2.fwd_fp16(Q, K, V, O, ...)
 //      fa2.fwd_bf16(Q, K, V, O, ...)    # added in the bf16-vendor step
 //
-//  Only built when ENABLE_FA2 is ON at CMake time (SM80/86/89/120). Thor
-//  builds skip this module entirely.
+//  Only built when ENABLE_FA2 is ON at CMake time
+//  (SM80/86/87/89/110/120/121).
 // ============================================================================
 
 #include <pybind11/pybind11.h>
@@ -182,10 +182,8 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("stream") = 0,
         kDocstring);
 
-    // Causal sibling. Same signature as fwd_bf16 but applies a causal
-    // mask inside FA2 (template Is_causal=true). Currently only
-    // head_dim=128 is built; calls with other head_dim abort with a
-    // clear message. Used by Qwen3-8B prefill (S=N causal self-attn).
+#ifdef FLASHRT_FA2_HAS_CAUSAL_WRAPPER
+    // Causal sibling is registered only when its wrapper is linked.
     m.def("fwd_bf16_causal", make_fwd(&fvk_attention_fa2_fwd_bf16_causal),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
         py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
@@ -197,4 +195,5 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("num_sms") = 0,
         py::arg("stream") = 0,
         kDocstring);
+#endif
 }

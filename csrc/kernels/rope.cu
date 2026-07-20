@@ -5,6 +5,7 @@
 
 #include "rope.cuh"
 #include "common.cuh"
+#include <cassert>
 
 // ── RoPE ──
 __global__ void rope_kernel(const __nv_bfloat16* __restrict__ rope_weights,
@@ -281,6 +282,8 @@ void qkv_split_rope_devpos(const __nv_bfloat16* qkv,
 // Q → contiguous (S, Q_dim)
 // K → Kc[kc_offset + s*kc_stride + k_col] with RoPE applied
 // V → Vc[kc_offset + s*kc_stride + v_col] direct copy
+// 原标量实现保留供对照；Pi0.5 固定偶数布局直接使用 half2 配对读写。
+/*
 __global__ void qkv_split_rope_kvcache_fp16_kernel(
     const __half* __restrict__ qkv, const __half* __restrict__ rope,
     __half* __restrict__ Q, __half* __restrict__ Kc, __half* __restrict__ Vc,
@@ -330,6 +333,56 @@ __global__ void qkv_split_rope_kvcache_fp16_kernel(
         Vc[kc_offset + s * kc_stride + v_col] = qkv[idx];
     }
 }
+*/
+
+__global__ void qkv_split_rope_kvcache_fp16_kernel(
+    const __half* __restrict__ qkv, const __half* __restrict__ rope,
+    __half* __restrict__ Q, __half* __restrict__ Kc, __half* __restrict__ Vc,
+    int S, int Q_dim, int K_dim, int HD, int qkv_stride,
+    int kc_offset, int kc_stride) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int pair_stride = qkv_stride / 2;
+    int total = S * pair_stride;
+    if (idx >= total) return;
+
+    int s = idx / pair_stride;
+    int p = idx % pair_stride;
+    int q_pairs = Q_dim / 2;
+    int k_pairs = K_dim / 2;
+
+    if (p < q_pairs) {
+        int c = p * 2;
+        int d_in_head = c % HD;
+        __half2 x = *reinterpret_cast<const __half2*>(qkv + s * qkv_stride + c);
+        __half2 r = *reinterpret_cast<const __half2*>(rope + s * HD + d_in_head);
+        float x0 = __half2float(__low2half(x));
+        float x1 = __half2float(__high2half(x));
+        float cos_v = __half2float(__low2half(r));
+        float sin_v = __half2float(__high2half(r));
+        __half2 out = __halves2half2(
+            __float2half(x0 * cos_v - x1 * sin_v),
+            __float2half(x1 * cos_v + x0 * sin_v));
+        *reinterpret_cast<__half2*>(Q + s * Q_dim + c) = out;
+    } else if (p < q_pairs + k_pairs) {
+        int k_col = (p - q_pairs) * 2;
+        __half2 x = *reinterpret_cast<const __half2*>(
+            qkv + s * qkv_stride + Q_dim + k_col);
+        __half2 r = *reinterpret_cast<const __half2*>(rope + s * HD + k_col);
+        float x0 = __half2float(__low2half(x));
+        float x1 = __half2float(__high2half(x));
+        float cos_v = __half2float(__low2half(r));
+        float sin_v = __half2float(__high2half(r));
+        __half2 out = __halves2half2(
+            __float2half(x0 * cos_v - x1 * sin_v),
+            __float2half(x1 * cos_v + x0 * sin_v));
+        *reinterpret_cast<__half2*>(Kc + kc_offset + s * kc_stride + k_col) = out;
+    } else {
+        int v_col = (p - q_pairs - k_pairs) * 2;
+        uint32_t packed = *reinterpret_cast<const uint32_t*>(
+            qkv + s * qkv_stride + Q_dim + K_dim + v_col);
+        *reinterpret_cast<uint32_t*>(Vc + kc_offset + s * kc_stride + v_col) = packed;
+    }
+}
 
 void qkv_split_rope_kvcache_fp16(
     const __half* qkv, const __half* rope,
@@ -337,9 +390,16 @@ void qkv_split_rope_kvcache_fp16(
     int S, int Q_dim, int K_dim, int HD, int qkv_stride,
     int kc_offset, int kc_stride,
     cudaStream_t stream) {
-    int total = S * qkv_stride;
+    bool use_half2 = ((Q_dim | K_dim | HD | qkv_stride |
+                       kc_offset | kc_stride) & 1) == 0 &&
+                     qkv_stride == Q_dim + 2 * K_dim;
+    assert(use_half2 &&
+           "qkv_split_rope_kvcache_fp16 requires even dimensions, aligned cache, and V_dim == K_dim");
+    if (!use_half2) return;
+
+    int total_pairs = S * (qkv_stride / 2);
     int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    int blocks = (total_pairs + threads - 1) / threads;
     qkv_split_rope_kvcache_fp16_kernel<<<blocks, threads, 0, stream>>>(
         qkv, rope, Q, Kc, Vc, S, Q_dim, K_dim, HD, qkv_stride,
         kc_offset, kc_stride);

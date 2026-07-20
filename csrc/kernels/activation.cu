@@ -6,6 +6,7 @@
 
 #include "activation.cuh"
 #include "common.cuh"
+#include <stdint.h>
 
 // ── Gate GELU Multiply ──
 // GELU(x) approx: x * sigmoid(1.5957691216 * x * (1 + 0.044715 * x^2))
@@ -216,6 +217,18 @@ void mul_fp16(const __half* a, const __half* b, __half* out, int n, cudaStream_t
 // ── Gate GELU Mul Merged -> FP8 ──
 // 4 elem/thread vectorized, matching production silu_mul_split_fp8_k throughput.
 // Merged layout: merged[s, 0..H-1] = gate, merged[s, H..2H-1] = up
+union Half4U64 {
+    uint64_t packed;
+    __half2 h2[2];
+};
+
+__device__ __forceinline__ void unpack_half4_u64(uint64_t packed, __half2& lo, __half2& hi) {
+    Half4U64 v;
+    v.packed = packed;
+    lo = v.h2[0];
+    hi = v.h2[1];
+}
+
 __global__ void gate_silu_mul_merged_fp8_kernel_fp16(const __half* merged, __nv_fp8_e4m3* out, int S, int H,
                                        const float* descale_ptr) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;  // 4 elements per thread
@@ -224,11 +237,20 @@ __global__ void gate_silu_mul_merged_fp8_kernel_fp16(const __half* merged, __nv_
 
     int s = i / H, h = i % H;
     int base = s * 2 * H;
+/*
     // Vectorized half2 loads from gate and up regions
     const __half2* gate2 = reinterpret_cast<const __half2*>(merged + base + h);
     const __half2* up2 = reinterpret_cast<const __half2*>(merged + base + H + h);
     __half2 gA = gate2[0], gB = gate2[1];
     __half2 uA = up2[0],   uB = up2[1];
+*/
+    // 优化：gate/up 各用一次 64-bit load 连续读取 4 个 FP16，替代原来的两次 half2 load。
+    // 保持每线程处理 4 个元素和原 grid 不变。
+    uint64_t gate_pack = *reinterpret_cast<const uint64_t*>(merged + base + h);
+    uint64_t up_pack = *reinterpret_cast<const uint64_t*>(merged + base + H + h);
+    __half2 gA, gB, uA, uB;
+    unpack_half4_u64(gate_pack, gA, gB);
+    unpack_half4_u64(up_pack, uA, uB);
 
     float gv[4] = {__half2float(gA.x), __half2float(gA.y),
                     __half2float(gB.x), __half2float(gB.y)};
@@ -280,7 +302,6 @@ void gate_silu_mul_merged_fp8(const __nv_bfloat16* merged, __nv_fp8_e4m3* out,
 void gate_silu_mul_merged_fp8_fp16(const __half* merged, __nv_fp8_e4m3* out,
                                     int seq, int half_dim,
                                     const float* d_scale, cudaStream_t stream) {
-    // 4 elem/thread, matching production throughput
     int total = seq * half_dim;
     int blocks = (total / 4 + 255) / 256;
     gate_silu_mul_merged_fp8_kernel_fp16<<<blocks, 256, 0, stream>>>(

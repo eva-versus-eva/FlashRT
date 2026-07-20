@@ -299,7 +299,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp16=False,
                use_fp8=True,
                state_prompt_mode="exact",
-               state_prompt_fixed_max_len=None):
+               state_prompt_fixed_max_len=None,
+               use_cuda_graph=True):
     """Load a FlashRT model.
 
     Args:
@@ -369,6 +370,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
+        use_cuda_graph: Enable CUDA graph capture/replay where supported.
         use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5 on Thor/RTX
             SM120/SM89, GROOT N1.6 on Thor/RTX SM120, and GROOT N1.7 on
             Thor/RTX SM120/SM89. Only valid with ``use_fp8=False``; an A/B
@@ -636,6 +638,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         kwargs["hardware"] = arch
     if "use_fp8" in sig.parameters:
         kwargs["use_fp8"] = use_fp8
+    if "use_cuda_graph" in sig.parameters:
+        kwargs["use_cuda_graph"] = use_cuda_graph
     if config == "pi0fast":
         kwargs.update(
             autotune=autotune,

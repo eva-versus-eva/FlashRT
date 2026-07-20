@@ -1208,8 +1208,15 @@ class Pi05TorchFrontendThor:
             self._fs_all_b2 = fs_all.view(steps, Sa, D3a).repeat_interleave(
                 B, dim=1).reshape(steps * B * Sa, D3a).contiguous()
 
-        # ---- Capture SigLIP graph first (warmup writes enc_x with real PostLN output) ----
-        self._capture_siglip_graph()
+        # ---- Prepare SigLIP/PostLN output used by calibration ----
+        if self.use_cuda_graph:
+            self._capture_siglip_graph()
+        else:
+            dummy_img = np.zeros((self.num_views, 224, 224, 3), dtype=np.float16)
+            self._img_buf.upload(dummy_img)
+            for _ in range(3):
+                self._run_siglip_direct(0, zero_siglip_input=True)
+            torch.cuda.synchronize()
 
         # ---- Calibrate FP8 scales (using SigLIP warmup output in enc_x) ----
         if self.use_fp8:
@@ -1223,13 +1230,14 @@ class Pi05TorchFrontendThor:
             self._ae_calib_scales = torch.zeros(self.steps * self.La * 4, dtype=torch.float32, device='cuda')
             logger.info("use_fp8=False — skipping FP8 calibration (FP16 baseline)")
 
-        # ---- Capture encoder+decoder graph ----
-        if self.autotune > 0:
-            self._autotune_enc_ae(n_trials=self.autotune, n_bench=10)
-        else:
-            self._capture_enc_ae_graph()
+        # ---- Capture encoder+decoder graph unless explicitly disabled ----
+        if self.use_cuda_graph:
+            if self.autotune > 0:
+                self._autotune_enc_ae(n_trials=self.autotune, n_bench=10)
+            else:
+                self._capture_enc_ae_graph()
 
-        self.graph_captured = True
+        self.graph_captured = self.use_cuda_graph
         self.calibrated = True
         logger.info("set_prompt done: '%s' (%d tokens, Se=%d, mode=%s)",
                     prompt_text, prompt_len, Se,
@@ -1443,6 +1451,28 @@ class Pi05TorchFrontendThor:
         }
         postln_project(self._gemm, fvk, postln_bufs, postln_weights,
                        postln_dims, stream=stream_int)
+
+    def _run_siglip_direct(self, stream_int=0, *, zero_siglip_input=False):
+        """Run patch_embed + SigLIP + PostLN without CUDA graph replay."""
+        self._patch_embed_ops(stream_int)
+        if zero_siglip_input:
+            self._sig_x.zero_()
+        siglip_forward(self._gemm, fvk, self._sig_bufs, self._sig_weights,
+                       self._sig_dims, stream=stream_int, attn=self._attn,
+                       use_fp8=self.use_fp8)
+        self._postln_project_ops(stream_int)
+
+    def _run_enc_ae_direct(self, stream_int=0):
+        """Run encoder + decoder without CUDA graph replay."""
+        enc_bufs, enc_weights, enc_dims = self._runtime_encoder_spec()
+        ae_bufs, ae_weights, ae_dims = self._runtime_decoder_spec()
+        self._Kc.zero_(); self._Vc.zero_()
+        encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
+                        enc_dims, stream=stream_int, attn=self._attn,
+                        use_fp8=self.use_fp8)
+        decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
+                        ae_dims, stream=stream_int, attn=self._attn,
+                        use_fp8=self.use_fp8)
 
     # -----------------------------------------------------------------------
     # CUDA graph capture
@@ -2542,19 +2572,22 @@ class Pi05TorchFrontendThor:
         images_np = np.stack([_to_np16(im) for im in img_list[:nv]])
         self._img_buf.upload(images_np)
 
-        # ---- Graph 1: SigLIP + PostLN ----
-        self._siglip_graph.replay()
+        # ---- SigLIP + PostLN ----
+        if self.use_cuda_graph:
+            self._siglip_graph.replay()
+        else:
+            self._run_siglip_direct(0)
 
         # ---- Lazy real-data recalibration on first call ----
         # Skip when use_fp8=False: the FP16 baseline path has no FP8
         # scales to refresh, and ``_recalibrate_with_real_data`` reads
         # FP8-specific attrs.
-        if self.use_fp8 and not self._real_data_calibrated:
+        if self.use_cuda_graph and self.use_fp8 and not self._real_data_calibrated:
             torch.cuda.synchronize()
             self._recalibrate_with_real_data()
             self._real_data_calibrated = True
 
-        # ---- Graph 2: Encoder + Decoder ----
+        # ---- Encoder + Decoder ----
         # numpy CPU RNG so the bit pattern matches the JAX frontend's
         # standard infer path (cross-backend determinism + lets the RL
         # CFG path's β=1.0 output collapse cleanly to this cond-only
@@ -2562,7 +2595,10 @@ class Pi05TorchFrontendThor:
         R_np = np.random.randn(self.Sa, 32).astype(np.float16)
         R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
         self._g_noise.view(-1, 32).copy_(R)
-        self._enc_ae_graph.replay()
+        if self.use_cuda_graph:
+            self._enc_ae_graph.replay()
+        else:
+            self._run_enc_ae_direct(0)
         torch.cuda.synchronize()
 
         latency_ms = (time.perf_counter() - t0) * 1000
