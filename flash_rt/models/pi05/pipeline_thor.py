@@ -173,8 +173,9 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
             # ── C2: QKV GEMM with descale ──
             w_scale_qkv = w_scales + (l * 4 + 0) * 4
             qw_ptr = qw + l * D * 2560
-            fvk.fp8_gemm_descale_fp16(xn_fp8, qw_ptr, qkv, S, 2560, D,
-                                       act_scale_qkv, w_scale_qkv, stream)
+            fvk.fp8_gemm_descale_fp16(
+                xn_fp8, qw_ptr, qkv, S, 2560, D,
+                act_scale_qkv, w_scale_qkv, stream)
 
             # ── C2b: Fused RoPE + QKV split + KV cache ──
             if fixed_shape:
@@ -190,33 +191,49 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
                                                  kv_offset, HD, stream)
 
             # ── C3: Cross-attention ──
-            if attn is not None:
-                attn.run("decoder", l, q_seq=S, kv_seq=total_keys, stream=stream)
+            act_scale_o = act_scales + (step_scale_base + l * 4 + 1) * 4
+            if not fixed_shape:
+                if attn is not None:
+                    slots = attn.get_slot_ptrs("decoder", l)
+                    K_ptr, V_ptr = slots["K"], slots["V"]
+                else:
+                    K_ptr = Kc + l * total_keys * HD * 2
+                    V_ptr = Vc + l * total_keys * HD * 2
+                # 原实现保留：三段 attention 写 FP16，再由独立 kernel 量化。
+                # fvk.attention_qkv_fp16(ctx, attn_out, K_ptr, V_ptr,
+                #                         logits, attn_out, S, total_keys,
+                #                         NH, HD, attn_scale, stream)
+                # fvk.quantize_fp8_static_fp16(
+                #     attn_out, ctx_fp8, act_scale_o, S * NH * HD, stream)
+                # 优化：保留 QK/softmax，将 PV epilogue 融合为同语义 FP8 输出。
+                fvk.attention_qkv_fp8out_col(
+                    ctx, attn_out, K_ptr, V_ptr, logits, ctx_fp8,
+                    S, total_keys, NH, HD, attn_scale, act_scale_o, stream)
             else:
-                K_ptr = Kc + l * total_keys * HD * 2
-                V_ptr = Vc + l * total_keys * HD * 2
-                fvk.attention_qkv_fp16(ctx, attn_out, K_ptr, V_ptr,
-                                        logits, attn_out,
-                                        S, total_keys, NH, HD, attn_scale, stream)
+                attn.run(
+                    "decoder", l, q_seq=S, kv_seq=total_keys,
+                    stream=stream)
+                fvk.quantize_fp8_static_fp16(
+                    attn_out, ctx_fp8, act_scale_o, S * NH * HD, stream)
 
             # ── C4: O proj ──
-            act_scale_o = act_scales + (step_scale_base + l * 4 + 1) * 4
             w_scale_o = w_scales + (l * 4 + 1) * 4
-            fvk.quantize_fp8_static_fp16(attn_out, ctx_fp8, act_scale_o, S * NH * HD, stream)
             ow_ptr = ow + l * NH * HD * D
-            fvk.fp8_gemm_descale_fp16(ctx_fp8, ow_ptr, fg, S, D, NH * HD,
-                                       act_scale_o, w_scale_o, stream)
+            fvk.fp8_gemm_descale_fp16(
+                ctx_fp8, ow_ptr, fg, S, D, NH * HD,
+                act_scale_o, w_scale_o, stream)
 
             # ── C4→C5: gate×residual + AdaRMSNorm → FP8 ──
             act_scale_gu = act_scales + (step_scale_base + l * 4 + 2) * 4
-            fvk.gate_res_adarms_fp8_static_fp16(fg, gate, x, sf_ptr,
-                                                  xn_fp8, gate, S, D, act_scale_gu, stream)
+            fvk.gate_res_adarms_fp8_static_fp16(
+                fg, gate, x, sf_ptr, xn_fp8, gate, S, D, act_scale_gu, stream)
 
             # ── C5: Gate+Up merged GEMM ──
             w_scale_gu = w_scales + (l * 4 + 2) * 4
             gw_ptr = gw + l * D * H * 2
-            fvk.fp8_gemm_descale_fp16(xn_fp8, gw_ptr, fg, S, H * 2, D,
-                                       act_scale_gu, w_scale_gu, stream)
+            fvk.fp8_gemm_descale_fp16(
+                xn_fp8, gw_ptr, fg, S, H * 2, D,
+                act_scale_gu, w_scale_gu, stream)
 
             # ── C6: SiLU(gate) × up → FP8 ──
             act_scale_down = act_scales + (step_scale_base + l * 4 + 3) * 4
@@ -225,16 +242,18 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
             # ── C6: Down GEMM ──
             w_scale_down = w_scales + (l * 4 + 3) * 4
             dw_ptr = dw + l * H * D
-            fvk.fp8_gemm_descale_fp16(hid_fp8, dw_ptr, fg, S, D, H,
-                                       act_scale_down, w_scale_down, stream)
+            fvk.fp8_gemm_descale_fp16(
+                hid_fp8, dw_ptr, fg, S, D, H,
+                act_scale_down, w_scale_down, stream)
 
             # ── C7→C1_next: gate×residual + next AdaRMSNorm → FP8 ──
             if l < layers - 1:
                 si_next = (s * layers + l + 1) * S * D3
                 sa_next_ptr = sa + si_next * 2
                 act_scale_next = act_scales + (step_scale_base + (l + 1) * 4 + 0) * 4
-                fvk.gate_res_adarms_fp8_static_fp16(fg, gate, x, sa_next_ptr,
-                                                      xn_fp8, gate, S, D, act_scale_next, stream)
+                fvk.gate_res_adarms_fp8_static_fp16(
+                    fg, gate, x, sa_next_ptr, xn_fp8, gate,
+                    S, D, act_scale_next, stream)
             else:
                 fvk.gate_res_fp16(fg, gate, x, S * D, stream)
 

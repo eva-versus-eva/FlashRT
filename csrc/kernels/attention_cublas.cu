@@ -13,6 +13,10 @@
 #include <cublas_v2.h>
 #include "softmax.cuh"
 
+extern "C" int cutlass_fp16_pv_fp8out_col(
+    void* A, void* B, void* D, int M, int N, int K,
+    const float* act_scale, cudaStream_t stream);
+
 // Fill every `stride`-th element with -inf (fp16 = 0xFBFF = -65504)
 // Used to mask pad columns in logits for odd-N attention.
 __global__ void fill_neginf_strided_kernel(__half* data, int stride, int count) {
@@ -66,6 +70,38 @@ void attention_qkv_fp16(
         &zero,
         out, CUDA_R_16F, HD,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+void attention_qkv_fp8out_col(
+    cublasHandle_t handle,
+    const __half* Q,
+    const __half* K,
+    const __half* V,
+    __half* logits,
+    void* out_fp8,
+    int S, int S_kv, int NH, int HD,
+    float attn_scale,
+    const float* out_scale,
+    cudaStream_t stream)
+{
+    cublasSetStream(handle, stream);
+    float zero = 0.0f;
+    cublasGemmEx(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        S_kv, S * NH, HD,
+        &attn_scale,
+        K, CUDA_R_16F, HD,
+        Q, CUDA_R_16F, HD,
+        &zero,
+        logits, CUDA_R_16F, S_kv,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+
+    softmax_fp16(logits, S * NH, S_kv, stream);
+
+    // 与 cuBLAS 相同：C_col[HD,S*NH] = V_col[HD,S_kv] * P_col[S_kv,S*NH]。
+    cutlass_fp16_pv_fp8out_col(
+        const_cast<__half*>(V), logits, out_fp8,
+        HD, S * NH, S_kv, out_scale, stream);
 }
 
 // Mask rows [seqused_k[0], S_kv_max) in every logits column.

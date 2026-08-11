@@ -22,6 +22,18 @@ void attention_qkv_fp16(
     float attn_scale,        // 1/sqrt(HD)
     cudaStream_t stream = 0);
 
+void attention_qkv_fp8out_col(
+    cublasHandle_t handle,
+    const __half* Q,
+    const __half* K,
+    const __half* V,
+    __half* logits,
+    void* out_fp8,
+    int S, int S_kv, int NH, int HD,
+    float attn_scale,
+    const float* out_scale,
+    cudaStream_t stream = 0);
+
 // Fixed-shape attention with a device-side valid K/V length.
 // QK and PV keep the graph-captured S_kv_max shape; logits rows
 // [seqused_k[0], S_kv_max) are masked before softmax.

@@ -105,6 +105,60 @@ int cutlass_fp16_sq_gelu(void* A, void* B, void* D, int M, int N, int K,
     return cutlass_run_impl_fp16<sm100_fp16_sq_gelu::Gemm>(A, B, D, M, N, K, alpha, beta, stream);
 }
 
+int cutlass_fp16_pv_fp8out_col(void* A, void* B, void* D,
+                                int M, int N, int K,
+                                const float* act_scale,
+                                cudaStream_t stream) {
+    using GemmOp = sm100_fp16_pv_fp8out_col::Gemm;
+    using ElementA = typename GemmOp::ElementA;
+    using ElementB = typename GemmOp::ElementB;
+    using ElementC = typename GemmOp::ElementC;
+    using ElementD = typename GemmOp::ElementD;
+
+    auto stride_A = cutlass::make_cute_packed_stride(
+        typename GemmOp::GemmKernel::StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(
+        typename GemmOp::GemmKernel::StrideB{}, {N, K, 1});
+    auto stride_C = cutlass::make_cute_packed_stride(
+        typename GemmOp::GemmKernel::StrideC{}, {M, N, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(
+        typename GemmOp::GemmKernel::StrideD{}, {M, N, 1});
+
+    typename GemmOp::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {(ElementA*)A, stride_A, (ElementB*)B, stride_B},
+        {{1.0f, 0.0f, nullptr, nullptr, {}, {}, {act_scale}},
+         (ElementC*)D, stride_C, (ElementD*)D, stride_D}
+    };
+
+    GemmOp gemm;
+    size_t ws_size = GemmOp::get_workspace_size(args);
+    static cutlass::device_memory::allocation<uint8_t> workspace(0);
+    if (ws_size > workspace.size()) {
+        workspace = cutlass::device_memory::allocation<uint8_t>(ws_size);
+    }
+    auto status = gemm.can_implement(args);
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "[CUTLASS-FP16] PV col cannot implement: M=%d N=%d K=%d status=%d\n",
+                M, N, K, int(status));
+        return -1;
+    }
+    status = gemm.initialize(args, workspace.get(), stream);
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "[CUTLASS-FP16] PV col init failed: M=%d N=%d K=%d status=%d\n",
+                M, N, K, int(status));
+        return -2;
+    }
+    status = gemm.run(stream);
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "[CUTLASS-FP16] PV col run failed: M=%d N=%d K=%d status=%d\n",
+                M, N, K, int(status));
+        return -3;
+    }
+    return 0;
+}
+
 // R3.1 Phase 2 runner: GEMM with LinCombDeEltAct epilogue that multiplies
 // the accumulator by an auxiliary tensor (gate_buf [M, N] row-major).
 // D[m,n] = (acc[m,n]) * Aux[m,n].

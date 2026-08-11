@@ -580,9 +580,10 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hd=256 2CTA forward uses the dedicated kernel on both SM100 and SM110.
+    # Thor's current DSL cannot compile the dedicated HD256 kernel; retain the
+    # verified generic SM110 path and use this implementation only on SM100.
     use_dedicated_hd256_kernel = (
-        arch // 10 in [10, 11]
+        arch // 10 == 10
         and head_dim == 256
         and head_dim_v == 256
     )

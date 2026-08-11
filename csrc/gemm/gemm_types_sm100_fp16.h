@@ -14,6 +14,7 @@
 #pragma once
 
 #include "cutlass/cutlass.h"
+#include "cutlass/float8.h"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -22,7 +23,10 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/epilogue/thread/activation.h"
+#include "cutlass/epilogue/fusion/operations.hpp"
+#include "cutlass/epilogue/fusion/sm100_callbacks_tma_warpspecialized.hpp"
 #include "cutlass/util/packed_stride.hpp"
+#include <cuda_fp16.h>
 
 using namespace cute;
 
@@ -32,6 +36,26 @@ using namespace cute;
 #define FLASHRT_CUTLASS_FP16_TYPES_DEFINED
 using cutlass_fp16_t = cutlass::half_t;
 #endif
+
+struct PvFp16RoundScaleArguments {
+  float const* scale_ptr = nullptr;
+};
+
+template <class T>
+struct PvFp16RoundScale {
+  using Arguments = PvFp16RoundScaleArguments;
+  CUTLASS_HOST_DEVICE
+  T operator()(T const& value, Arguments const& args) const {
+    T out;
+    float inv_scale = 1.0f / fmaxf(*args.scale_ptr, 1e-12f);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) {
+      float rounded = __half2float(__float2half_rn(value[i]));
+      out[i] = rounded * inv_scale;
+    }
+    return out;
+  }
+};
 
 // GELU tanh-approximation activation matching gate_silu_mul_merged_kernel
 // (csrc/kernels/activation.cu): x * sigmoid(1.59576... * x * (1 + 0.04471 x^2))
@@ -329,3 +353,27 @@ using Main = typename cutlass::gemm::collective::CollectiveBuilder<
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
     cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
 }  // namespace sm100_fp16_wide
+
+// Decoder PV 使用 cuBLAS 列主序视图，并在 epilogue 保持 FP16 舍入后写 FP8。
+namespace sm100_fp16_pv_fp8out_col {
+using Tile = Shape<_128, _16, _128>;
+using Cluster = Shape<_2, _1, _1>;
+using Fusion = cutlass::epilogue::fusion::LinCombEltAct<
+    PvFp16RoundScale, cutlass::float_e4m3_t, float>;
+using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
+    float, float, cutlass::float_e4m3_t, cutlass::layout::ColumnMajor, 16,
+    cutlass::float_e4m3_t, cutlass::layout::ColumnMajor, 16,
+    cutlass::epilogue::TmaWarpSpecialized2Sm, Fusion>::CollectiveOp;
+using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass_fp16_t, cutlass::layout::ColumnMajor, 8,
+    cutlass_fp16_t, cutlass::layout::ColumnMajor, 8,
+    float, Tile, Cluster,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename Epi::SharedStorage))>,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmSm100>::CollectiveOp;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
+    cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
+}  // namespace sm100_fp16_pv_fp8out_col

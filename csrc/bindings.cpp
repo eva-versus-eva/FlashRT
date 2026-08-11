@@ -426,6 +426,8 @@ extern "C" float launch_w4a8_gemm(void*, void*, void*, void*, void*, void*, int,
 extern "C" int cutlass_fp8_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_t1(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_wide(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp8_wide_geglu_fp8out(void*, void*, void*, void*, int, int, int, float, const float*, cudaStream_t);
+extern "C" int cutlass_fp8_siglip_gelu_fp8out(void*, void*, void*, void*, int, int, int, float, cudaStream_t);
 // CUTLASS FP16 variants (encoder/SigLIP FP16 path)
 extern "C" int cutlass_fp16_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -436,6 +438,7 @@ extern "C" int cutlass_fp16_2sm21(void*, void*, void*, int, int, int, float, flo
 extern "C" int cutlass_fp16_k64_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sq_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_k64_mul_aux(void*, void*, void*, void*, int, int, int, cudaStream_t);
+extern "C" int cutlass_fp16_pv_fp8out_col(void*, void*, void*, int, int, int, const float*, cudaStream_t);
 #ifdef FLASHRT_HAVE_SM100_ENCODER_MLP
 extern "C" int encoder_mlp_fused_fp16(void*, void*, void*, void*,
                                        void*, void*, void*, void*,
@@ -1878,6 +1881,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
 
+    m.def("attention_qkv_fp8out_col", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+                                    uintptr_t logits, uintptr_t out_fp8,
+                                    int S, int S_kv, int NH, int HD,
+                                    float attn_scale, uintptr_t out_scale,
+                                    uintptr_t stream) {
+        attention_qkv_fp8out_col(ctx.cublas_handle,
+                            reinterpret_cast<const __half*>(Q),
+                            reinterpret_cast<const __half*>(K),
+                            reinterpret_cast<const __half*>(V),
+                            reinterpret_cast<__half*>(logits),
+                            to_ptr(out_fp8),
+                            S, S_kv, NH, HD, attn_scale,
+                            reinterpret_cast<const float*>(out_scale),
+                            to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out_fp8"),
+       py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("attn_scale"), py::arg("out_scale"), py::arg("stream") = 0);
+
     // Fixed-shape cuBLAS decomposed attention. S_kv_max is graph-captured;
     // seqused_k is a device int32[1] containing the valid K/V rows.
     m.def("attention_qkv_fp16_seqused", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
@@ -1981,6 +2003,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("A"), py::arg("B"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp8_wide_geglu_fp8out", [](uintptr_t A, uintptr_t B_up, uintptr_t gate_aux, uintptr_t D,
+                                               int M, int N, int K, float alpha,
+                                               uintptr_t act_scale, uintptr_t stream) {
+        return cutlass_fp8_wide_geglu_fp8out(
+            to_ptr(A), to_ptr(B_up), to_ptr(gate_aux), to_ptr(D),
+            M, N, K, alpha, reinterpret_cast<const float*>(act_scale), to_stream(stream));
+    }, py::arg("A"), py::arg("B_up"), py::arg("gate_aux"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+           py::arg("alpha"), py::arg("act_scale"), py::arg("stream") = 0);
+
+    m.def("cutlass_fp8_siglip_gelu_fp8out", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                                 uintptr_t bias, int M, int N, int K,
+                                                 float alpha, uintptr_t stream) {
+        return cutlass_fp8_siglip_gelu_fp8out(
+            to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
+            M, N, K, alpha, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha"), py::arg("stream") = 0);
 
     m.def("cutlass_fp8_plain", [](uintptr_t A, uintptr_t B, uintptr_t D,
                                     int M, int N, int K, float alpha, float beta, uintptr_t stream) {

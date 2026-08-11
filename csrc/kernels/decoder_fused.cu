@@ -51,6 +51,8 @@ __global__ void gate_res_adarms_fp8_static_fp16_kernel(
     __half* __restrict__ residual, const __half* __restrict__ style,
     __nv_fp8_e4m3* __restrict__ fp8_out, __half* __restrict__ gate_out,
     int S, int D, const float* __restrict__ descale_ptr) {
+    // 原标量实现保留供对照。
+/*
     int r = blockIdx.x; if (r >= S) return;
     const __half* sc = style + r * 3 * D;
     const __half* sh = sc + D;
@@ -75,6 +77,70 @@ __global__ void gate_res_adarms_fp8_static_fp16_kernel(
         float normed = v * (1.0f + __half2float(sc[i])) + __half2float(sh[i]);
         fp8_out[r*D+i] = __nv_fp8_e4m3(fminf(fmaxf(normed * inv_scale, -448.0f), 448.0f));
         gate_out[r*D+i] = __float2half(__half2float(gt[i]));
+    }
+*/
+    // 优化：half2 向量读写并缓存已舍入 residual，减少第二遍显存读取。
+    int r = blockIdx.x;
+    int row = r * D;
+    int pairs = D / 2;
+    const auto* gemm2 = reinterpret_cast<const __half2*>(gemm_out + row);
+    const auto* prev2 = reinterpret_cast<const __half2*>(prev_gate + row);
+    auto* res2 = reinterpret_cast<__half2*>(residual + row);
+    const auto* style2 = reinterpret_cast<const __half2*>(style + r * 3 * D);
+    auto* out2 = reinterpret_cast<__nv_fp8x2_e4m3*>(fp8_out + row);
+    auto* gate2 = reinterpret_cast<__half2*>(gate_out + row);
+
+    float2 cached[2];
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int it = 0; it < 2; ++it) {
+        int i = threadIdx.x + it * blockDim.x;
+        float2 res = __half22float2(res2[i]);
+        float2 gemm = __half22float2(gemm2[i]);
+        float2 gate = __half22float2(prev2[i]);
+        res.x += gemm.x * gate.x;
+        res.y += gemm.y * gate.y;
+        __half2 rounded = __floats2half2_rn(res.x, res.y);
+        res2[i] = rounded;
+        cached[it] = __half22float2(rounded);
+        sum_sq += res.x * res.x + res.y * res.y;
+    }
+
+    __shared__ float shared[8];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    for (int o = 16; o > 0; o >>= 1) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, o);
+    }
+    if (lane == 0) shared[warp] = sum_sq;
+    __syncthreads();
+    if (warp == 0) {
+        sum_sq = lane < 8 ? shared[lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) {
+            sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, o);
+        }
+        if (lane == 0) {
+            shared[0] = rsqrtf(sum_sq / D + 1e-6f);
+            shared[1] = 1.0f / fmaxf(*descale_ptr, 1e-12f);
+        }
+    }
+    __syncthreads();
+    float rstd = shared[0];
+    float inv_scale = shared[1];
+
+#pragma unroll
+    for (int it = 0; it < 2; ++it) {
+        int i = threadIdx.x + it * blockDim.x;
+        float2 scale = __half22float2(style2[i]);
+        float2 shift = __half22float2(style2[pairs + i]);
+        float2 normed = make_float2(
+            cached[it].x * rstd * (1.0f + scale.x) + shift.x,
+            cached[it].y * rstd * (1.0f + scale.y) + shift.y);
+        normed.x = fminf(fmaxf(normed.x * inv_scale, -448.0f), 448.0f);
+        normed.y = fminf(fmaxf(normed.y * inv_scale, -448.0f), 448.0f);
+        out2[i] = __nv_fp8x2_e4m3{normed};
+        gate2[i] = style2[2 * pairs + i];
     }
 }
 
@@ -149,7 +215,11 @@ void gate_res_adarms_fp8_static_fp16(const __half* gemm_out, const __half* prev_
                                        __nv_fp8_e4m3* fp8_out, __half* gate_out,
                                        int S, int D, const float* descale_ptr,
                                        cudaStream_t stream) {
-    gate_res_adarms_fp8_static_fp16_kernel<<<S, 256, 8*sizeof(float), stream>>>(
+    if (D != 1024) {
+        throw std::invalid_argument(
+            "gate_res_adarms_fp8_static_fp16 requires D=1024");
+    }
+    gate_res_adarms_fp8_static_fp16_kernel<<<S, 256, 0, stream>>>(
         gemm_out, prev_gate, residual, style, fp8_out, gate_out, S, D, descale_ptr);
 }
 
