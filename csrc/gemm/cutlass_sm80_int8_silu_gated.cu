@@ -1,9 +1,9 @@
 // ================================================================
-// FlashRT — CUTLASS SM80 INT8 GEMM + SiLU-Gated epilogue
+// FlashRT — CUTLASS SM80 INT8 GEMM + GELU-Gated epilogue
 //
-// Fuses the Up-projection GEMM with the gated SiLU activation,
+// Fuses the Up-projection GEMM with the gated GELU activation,
 // reading the Gate buffer (from a prior Gate GEMM) via VisitorAuxLoad
-// and computing hidden[i,j] = SiLU(gate[i,j]) * up_scaled[i,j]
+// and computing hidden[i,j] = GELU(gate[i,j]) * up_scaled[i,j]
 // directly in the GEMM epilogue — avoiding a separate
 // gate_geglu_merged kernel and the associated global-memory round-trip.
 //
@@ -75,15 +75,16 @@ using MulWtScale   = cutlass::epilogue::threadblock::VisitorCompute<
 using GateLoad = cutlass::epilogue::threadblock::VisitorAuxLoad<
     OutputTileThreadMap, cutlass::bfloat16_t, Stride<int64_t, _1, int64_t>>;
 
-// ── Custom binary functor template: out = up_scaled * SiLU(gate)
-//    SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// ── Custom binary functor template: out = up_scaled * GELU-tanh(gate)
+//    This logistic form is algebraically equivalent to the tanh approximation:
+//    GELU(x) = x / (1 + exp(-2 * sqrt(2/pi) * x * (1 + 0.044715*x^2)))
 //
 //    VisitorCompute<F, ...> requires F to be a class template
 //    template<class T> struct F { T operator()(T, T); }.
 //    In Sm80EVT, T can be either float (scalar) or
 //    cutlass::Array<float, N> (batch). Use tag-dispatch to handle both.
 template <class T>
-struct GatedSiLUFunctor {
+struct GatedGELUFunctor {
     __device__ T operator()(T up_val, T gate_val) const {
         return impl(up_val, gate_val,
                     typename cutlass::platform::is_floating_point<T>::type{});
@@ -95,7 +96,11 @@ private:
     __device__ S impl(S up, S gate,
                       cutlass::platform::true_type) const {
         float g = float(gate);
-        return S(float(up) * g / (1.0f + expf(-g)));
+        // return S(float(up) * g / (1.0f + expf(-g)));
+        // Pi0.5 使用 GELU-tanh，与 OpenPI、Thor 和 BF16 路径保持一致。
+        float gelu = g / (1.0f + expf(
+            -1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+        return S(float(up) * gelu);
     }
 
     // Array path: T = cutlass::Array<ElementT, N, Align>
@@ -106,15 +111,19 @@ private:
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < Arr::kElements; ++i) {
             float g = float(gate[i]);
-            result[i] = typename Arr::Element(float(up[i]) * g / (1.0f + expf(-g)));
+            // result[i] = typename Arr::Element(float(up[i]) * g / (1.0f + expf(-g)));
+            // Pi0.5 使用 GELU-tanh，与 OpenPI、Thor 和 BF16 路径保持一致。
+            float gelu = g / (1.0f + expf(
+                -1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+            result[i] = typename Arr::Element(float(up[i]) * gelu);
         }
         return result;
     }
 };
 
-// ── Multiply scaled up-accumulator by SiLU(gate) ──
-using MulGatedSiLU = cutlass::epilogue::threadblock::VisitorCompute<
-    GatedSiLUFunctor, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
+// ── Multiply scaled up-accumulator by GELU-tanh(gate) ──
+using MulGatedGELU = cutlass::epilogue::threadblock::VisitorCompute<
+    GatedGELUFunctor, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
 
 // ── Output store ──
 using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<
@@ -126,15 +135,15 @@ using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<
 //   AccFetch ─────────────────────────────────────────────────────┐
 //   ActScaleLoad ─── MulActScale ─── EVT_AccMulAct               │
 //   WtScaleLoad  ─── MulWtScale  ─── EVT_MulBoth (up_scaled) ───┤
-//   GateLoad      ── GatedSiLU   ─── EVT_SiluGated               │
+//   GateLoad      ── GatedGELU   ─── EVT_GeluGated               │
 //   StoreD ←──────────────────────────────────────────────────────┘
 using EVT_AccMulAct = cutlass::epilogue::threadblock::Sm80EVT<
     MulActScale, AccFetch, ActScaleLoad>;
 using EVT_MulBoth = cutlass::epilogue::threadblock::Sm80EVT<
     MulWtScale, EVT_AccMulAct, WtScaleLoad>;
-using EVT_SiluGated = cutlass::epilogue::threadblock::Sm80EVT<
-    MulGatedSiLU, EVT_MulBoth, GateLoad>;
-using EVT_Final = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVT_SiluGated>;
+using EVT_GeluGated = cutlass::epilogue::threadblock::Sm80EVT<
+    MulGatedGELU, EVT_MulBoth, GateLoad>;
+using EVT_Final = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVT_GeluGated>;
 
 using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
     ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA,
@@ -159,7 +168,7 @@ static int run(
         void const* act_scale, // (M,)   float32 per-row activation scales
         void const* wt_scale,  // (N,)   float32 per-col weight scales
         void const* gate_buf,  // (M, N) BF16   gate values from prior Gate GEMM
-        void*       D,         // (M, N) BF16   output: SiLU(gate) * up
+        void*       D,         // (M, N) BF16   output: GELU(gate) * up
         int M, int N, int K,
         cudaStream_t stream) {
 
@@ -168,7 +177,7 @@ static int run(
     // EVT argument tree: children first, op args last (matches Sm80EVT convention).
     // Mirrors the existing cutlass_sm80_int8_rowwise.cu pattern exactly.
     typename EVT_Final::Arguments evt_args{
-        // EVT_SiluGated::Arguments {EVT_MulBoth_args, GateLoad_args, GatedSiLU_op_args}
+        // EVT_GeluGated::Arguments {EVT_MulBoth_args, GateLoad_args, GatedGELU_op_args}
         {
             // EVT_MulBoth::Arguments {EVT_AccMulAct_args, WtScaleLoad_args, MulWtScale_op}
             {
@@ -192,7 +201,7 @@ static int run(
                 {static_cast<int64_t>(N), _1{},
                  static_cast<int64_t>(M) * static_cast<int64_t>(N)}
             },
-            {}             // GatedSiLU op — empty (template functor, stateless)
+            {}             // GatedGELU op — empty (template functor, stateless)
         },
         // StoreD::Arguments {ptr, layout_stride}
         {

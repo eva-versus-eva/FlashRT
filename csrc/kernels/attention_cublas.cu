@@ -13,9 +13,12 @@
 #include <cublas_v2.h>
 #include "softmax.cuh"
 
+#ifdef ENABLE_SM100_CUTLASS
+// Thor 专用：该 attention 输出路径依赖 SM100 CUTLASS PV kernel。
 extern "C" int cutlass_fp16_pv_fp8out_col(
     void* A, void* B, void* D, int M, int N, int K,
     const float* act_scale, cudaStream_t stream);
+#endif
 
 // Fill every `stride`-th element with -inf (fp16 = 0xFBFF = -65504)
 // Used to mask pad columns in logits for odd-N attention.
@@ -72,6 +75,7 @@ void attention_qkv_fp16(
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+#ifdef ENABLE_SM100_CUTLASS
 void attention_qkv_fp8out_col(
     cublasHandle_t handle,
     const __half* Q,
@@ -103,6 +107,7 @@ void attention_qkv_fp8out_col(
         const_cast<__half*>(V), logits, out_fp8,
         HD, S * NH, S_kv, out_scale, stream);
 }
+#endif
 
 // Mask rows [seqused_k[0], S_kv_max) in every logits column.
 // logits is col-major [S_kv_max, S*NH].

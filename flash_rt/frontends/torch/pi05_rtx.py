@@ -180,6 +180,7 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
     ep = "paligemma_with_expert.paligemma.model.language_model.layers"
     enc_qkv_list, enc_o_list = [], []
     enc_gate_list, enc_up_list, enc_down_list = [], [], []
+    enc_gate_raw_list, enc_up_raw_list, enc_ffn_norm_eff_list = [], [], []
 
     for i in range(ENC_L):
         # CRITICAL: fuse in FP32 — bf16 rounds values near -1.0 to exactly
@@ -203,10 +204,18 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
         ffn_scale = g_raw(f"{ep}.{i}.post_attention_layernorm.weight").float()
         fuse_ffn = 1.0 + ffn_scale
 
-        gate_w = g_raw(f"{ep}.{i}.mlp.gate_proj.weight").float() * fuse_ffn.unsqueeze(0)
-        up_w = g_raw(f"{ep}.{i}.mlp.up_proj.weight").float() * fuse_ffn.unsqueeze(0)
+        # gate_w = g_raw(f"{ep}.{i}.mlp.gate_proj.weight").float() * fuse_ffn.unsqueeze(0)
+        # up_w = g_raw(f"{ep}.{i}.mlp.up_proj.weight").float() * fuse_ffn.unsqueeze(0)
+        # INT8 需要 raw weight，并在 activation 量化前应用 learned scale。
+        gate_w_raw = g_raw(f"{ep}.{i}.mlp.gate_proj.weight").float()
+        up_w_raw = g_raw(f"{ep}.{i}.mlp.up_proj.weight").float()
+        gate_w = gate_w_raw * fuse_ffn.unsqueeze(0)
+        up_w = up_w_raw * fuse_ffn.unsqueeze(0)
         enc_gate_list.append(gate_w.t().to(bf16))
         enc_up_list.append(up_w.t().to(bf16))
+        enc_gate_raw_list.append(gate_w_raw.t().to(bf16))
+        enc_up_raw_list.append(up_w_raw.t().to(bf16))
+        enc_ffn_norm_eff_list.append(fuse_ffn.to(bf16))
 
         enc_down_list.append(g(f"{ep}.{i}.mlp.down_proj.weight").t())
 
@@ -215,6 +224,9 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
     ckpt["encoder_ffn_gate_w"] = torch.stack(enc_gate_list)
     ckpt["encoder_ffn_up_w"] = torch.stack(enc_up_list)
     ckpt["encoder_ffn_down_w"] = torch.stack(enc_down_list)
+    ckpt["encoder_ffn_gate_w_int8_source"] = torch.stack(enc_gate_raw_list)
+    ckpt["encoder_ffn_up_w_int8_source"] = torch.stack(enc_up_raw_list)
+    ckpt["encoder_post_attn_norm_eff_w"] = torch.stack(enc_ffn_norm_eff_list)
 
     # ── Decoder (18 Gemma-300M layers) ──
     dp = "paligemma_with_expert.gemma_expert.model.layers"
@@ -578,6 +590,9 @@ class Pi05TorchFrontendRtx:
         # memory stays alive across pipeline rebuilds).
         self._ckpt_bf16 = {}
         for k, v in raw_ckpt.items():
+            if (k.endswith("_int8_source")
+                    and not self._use_int8_encoder):
+                continue
             if isinstance(v, torch.Tensor):
                 self._ckpt_bf16[k] = v.to("cuda", bf16).contiguous()
             else:
@@ -604,6 +619,8 @@ class Pi05TorchFrontendRtx:
             self._quantize_decoder_int8()
         if self._use_int8_encoder:
             self._quantize_encoder_int8()
+            self._ckpt_bf16.pop("encoder_ffn_gate_w_int8_source")
+            self._ckpt_bf16.pop("encoder_ffn_up_w_int8_source")
         if self._use_int8_vision:
             self._quantize_vision_int8()
         if self._use_int8_vision_static:
@@ -785,7 +802,7 @@ class Pi05TorchFrontendRtx:
         for i in range(DEC_L):
             quant(f"decoder_attn_qkv_w_{i}", W["decoder_attn_qkv_w"][i])
             quant(f"decoder_attn_o_w_{i}", W["decoder_attn_o_w"][i])
-            # Separate gate and up for SiLU-gated EVT fusion (same as encoder).
+            # Separate gate and up for GELU-gated EVT fusion (same as encoder).
             quant(f"decoder_ffn_gate_w_{i}", W["decoder_ffn_gate_w"][i])
             quant(f"decoder_ffn_up_w_{i}", W["decoder_ffn_up_w"][i])
             quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
@@ -825,12 +842,18 @@ class Pi05TorchFrontendRtx:
         for i in range(ENC_L):
             quant(f"encoder_attn_qkv_w_{i}", W["encoder_attn_qkv_w"][i])
             quant(f"encoder_attn_o_w_{i}", W["encoder_attn_o_w"][i])
-            # Keep gate and up SEPARATE for SiLU-gated EVT fusion.
-            # The new cutlass_int8_silu_gated_bf16out kernel reads gate_buf
-            # produced by the gate GEMM and fuses SiLU(gate)*up in the
-            # epilogue, eliminating the separate gate_geglu_merged kernel.
-            quant(f"encoder_ffn_gate_w_{i}", W["encoder_ffn_gate_w"][i])
-            quant(f"encoder_ffn_up_w_{i}", W["encoder_ffn_up_w"][i])
+            # Gate GEMM writes gate_buf; the Up epilogue computes GELU(gate)*up.
+            # quant(f"encoder_ffn_gate_w_{i}", W["encoder_ffn_gate_w"][i])
+            # quant(f"encoder_ffn_up_w_{i}", W["encoder_ffn_up_w"][i])
+            # INT8 在激活量化前应用 learned scale，因此 Gate/Up 量化原始权重。
+            quant(
+                f"encoder_ffn_gate_w_{i}",
+                W["encoder_ffn_gate_w_int8_source"][i],
+            )
+            quant(
+                f"encoder_ffn_up_w_{i}",
+                W["encoder_ffn_up_w_int8_source"][i],
+            )
             quant(f"encoder_ffn_down_w_{i}", W["encoder_ffn_down_w"][i])
 
         logger.info("INT8 quantized %d encoder GEMM weights", 5 * ENC_L)
@@ -910,6 +933,8 @@ class Pi05TorchFrontendRtx:
             "encoder_multi_modal_projector_b": p("encoder_multi_modal_projector_b"),
             "encoder_attn_qkv_w": p_list("encoder_attn_qkv_w"),
             "encoder_attn_o_w": p_list("encoder_attn_o_w"),
+            "encoder_post_attn_norm_eff_w": p_list(
+                "encoder_post_attn_norm_eff_w"),
             "encoder_ffn_gate_w": p_list("encoder_ffn_gate_w"),
             "encoder_ffn_up_w": p_list("encoder_ffn_up_w"),
             "encoder_ffn_down_w": p_list("encoder_ffn_down_w"),

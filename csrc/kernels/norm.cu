@@ -1180,9 +1180,15 @@ __global__ void residual_add_rms_norm_int8_rowwise_kernel(
     float sum_sq = 0.f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float ri = __bfloat162float(res_row[i]) + __bfloat162float(x_row[i]);
-        res_row[i] = __float2bfloat16(ri);
-        smem[i] = ri;
-        sum_sq += ri * ri;
+        // res_row[i] = __float2bfloat16(ri);
+        // smem[i] = ri;
+        // sum_sq += ri * ri;
+        // 严格复现独立 residual_add 后的 BF16 落地，再参与 RMSNorm。
+        __nv_bfloat16 ri_bf16 = __float2bfloat16(ri);
+        float ri_rounded = __bfloat162float(ri_bf16);
+        res_row[i] = ri_bf16;
+        smem[i] = ri_rounded;
+        sum_sq += ri_rounded * ri_rounded;
     }
     float rms = rsqrtf(block_reduce_sum(sum_sq, partial) / cols + eps);
 
@@ -1190,8 +1196,12 @@ __global__ void residual_add_rms_norm_int8_rowwise_kernel(
     float max_abs = 0.f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float v = smem[i] * rms * __bfloat162float(weight[i]);
-        smem[i] = v;
-        max_abs = fmaxf(max_abs, fabsf(v));
+        // smem[i] = v;
+        // max_abs = fmaxf(max_abs, fabsf(v));
+        // 严格复现独立 RMSNorm 输出的 BF16 落地，再计算 INT8 scale。
+        float v_rounded = __bfloat162float(__float2bfloat16(v));
+        smem[i] = v_rounded;
+        max_abs = fmaxf(max_abs, fabsf(v_rounded));
     }
     float scale = fmaxf(block_reduce_max(max_abs, partial) / 127.f, 1e-12f);
     if (threadIdx.x == 0) scales[row] = scale;

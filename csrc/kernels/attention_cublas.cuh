@@ -22,6 +22,8 @@ void attention_qkv_fp16(
     float attn_scale,        // 1/sqrt(HD)
     cudaStream_t stream = 0);
 
+#ifdef ENABLE_SM100_CUTLASS
+// Thor 专用：PV 阶段直接输出 FP8，并依赖 SM100 CUTLASS kernel。
 void attention_qkv_fp8out_col(
     cublasHandle_t handle,
     const __half* Q,
@@ -33,6 +35,7 @@ void attention_qkv_fp8out_col(
     float attn_scale,
     const float* out_scale,
     cudaStream_t stream = 0);
+#endif
 
 // Fixed-shape attention with a device-side valid K/V length.
 // QK and PV keep the graph-captured S_kv_max shape; logits rows

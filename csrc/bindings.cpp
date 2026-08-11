@@ -1881,6 +1881,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
 
+#ifdef ENABLE_SM100_CUTLASS
+    // Thor 专用 binding；SM8x 构建不链接对应的 CUTLASS PV kernel。
     m.def("attention_qkv_fp8out_col", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
                                     uintptr_t logits, uintptr_t out_fp8,
                                     int S, int S_kv, int NH, int HD,
@@ -1899,6 +1901,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("logits"), py::arg("out_fp8"),
        py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale"), py::arg("out_scale"), py::arg("stream") = 0);
+#endif
 
     // Fixed-shape cuBLAS decomposed attention. S_kv_max is graph-captured;
     // seqused_k is a device int32[1] containing the valid K/V rows.
