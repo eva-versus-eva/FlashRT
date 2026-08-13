@@ -28,12 +28,14 @@ def paligemma_siglip_block(
     model_root: str = "paligemma_with_expert.paligemma.model",
     num_layers: int = 27,
     use_fp8: bool = True,
+    native_fp8_fc1: bool = False,
 ) -> LayerBlock:
     """SigLIP encoder block used by Pi0.5 / Pi0 / Pi0-FAST torch frontends.
 
-    27 layers × (LN1, LN2, fused QKV, O, FC1, FC2). All quantized GEMMs
-    go through ``.T.contiguous()`` + per-tensor FP8 quant; scales land
-    in ``target._sig_alpha`` in (q, o, up, down) order per layer.
+    27 layers × (LN1, LN2, fused QKV, O, FC1, FC2). Quantized GEMMs use
+    ``.T.contiguous()`` + per-tensor FP8 quant by default; Pi0.5 can keep
+    FC1 in checkpoint-native ``[N, K]`` for its fused CUTLASS epilogue.
+    Scales land in ``target._sig_alpha`` in (q, o, up, down) order.
 
     When ``use_fp8=False``, weights stay FP16 in the same ``[K, N]``
     row-major layout (the ``T()`` transpose is kept so ``gemm.fp16_nn``
@@ -47,7 +49,11 @@ def paligemma_siglip_block(
     """
     qkv_tx  = [T(), Quant()]              if use_fp8 else [T()]
     o_tx    = [ToFp16(), T(), Quant()]    if use_fp8 else [ToFp16(), T()]
-    up_tx   = [ToFp16(), T(), Quant()]    if use_fp8 else [ToFp16(), T()]
+    # 原实现统一转置 FC1；Pi0.5 FP8 epilogue 可直接量化 checkpoint 的 [N,K] 布局。
+    # up_tx = [ToFp16(), T(), Quant()] if use_fp8 else [ToFp16(), T()]
+    up_tx = ([ToFp16(), Quant()] if native_fp8_fc1
+             else [ToFp16(), T(), Quant()]) if use_fp8 else [ToFp16(), T()]
+    up_sink = "_sig_up_w_fp8out" if use_fp8 and native_fp8_fc1 else "_sig_up_w"
     down_tx = [ToFp16(), T(), Quant()]    if use_fp8 else [ToFp16(), T()]
     scale_into = "_sig_alpha" if use_fp8 else None
     vp = f"{model_root}.vision_tower.vision_model.encoder.layers.{{i}}"
@@ -78,7 +84,7 @@ def paligemma_siglip_block(
 
         Item("up_w", f"{vp}.mlp.fc1.weight",
              up_tx,
-             TensorList("_sig_up_w"), scale_into=scale_into),
+             TensorList(up_sink), scale_into=scale_into),
         Item("up_b", f"{vp}.mlp.fc1.bias",
              [ToFp16()], TensorList("_sig_up_b")),
 

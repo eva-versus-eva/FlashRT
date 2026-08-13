@@ -89,7 +89,8 @@ def build_spec(*, use_fp8: bool = True) -> ModelWeightSpec:
     return ModelWeightSpec(
         framework="torch",
         blocks=[
-            paligemma_siglip_block(use_fp8=use_fp8),
+            # Pi0.5 FC1 直接加载 fused epilogue 需要的 [N,K]，不再保留转置副本。
+            paligemma_siglip_block(use_fp8=use_fp8, native_fp8_fc1=True),
             paligemma_encoder_block(use_fp8=use_fp8),
             _decoder_block(use_fp8=use_fp8),
             _decoder_mods_block(),

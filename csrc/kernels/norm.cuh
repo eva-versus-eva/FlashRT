@@ -121,6 +121,10 @@ void residual_add_rms_norm_fp8_noweight_fp16(__half* residual, const __half* x,
                                                const float* d_scale,
                                                cudaStream_t stream = 0);
 
+void residual_add_rms_norm_fp8_noweight_rounded_fp16(
+    __half* residual, const __half* x, __nv_fp8_e4m3* out,
+    int seq_len, int dim, const float* d_scale, cudaStream_t stream = 0);
+
 // BF16 noweight variants — for models with activations exceeding FP16 range
 void rms_norm_fp8_noweight_bf16(const __nv_bfloat16* x, __nv_fp8_e4m3* out,
                                  int seq_len, int dim,

@@ -762,6 +762,139 @@ void residual_add_rms_norm_fp8_noweight_fp16(__half* residual, const __half* x,
         residual, x, out, dim, d_scale);
 }
 
+__global__ void res_rms_fp8_noweight_rounded_kernel(
+    __half* residual, const __half* x, __nv_fp8_e4m3* out, int D,
+    const float* descale_ptr) {
+    int r = blockIdx.x;
+    __half2* res2 = reinterpret_cast<__half2*>(residual + r * D);
+    const __half2* x2 = reinterpret_cast<const __half2*>(x + r * D);
+    __nv_fp8_e4m3* orow = out + r * D;
+    int D2 = D / 2;
+
+    float cache[RMS_NW_ELEMS_PER_THREAD];
+    float ssq = 0.0f;
+    #pragma unroll
+    for (int it = 0; it < RMS_NW_ELEMS_PER_THREAD / 2; ++it) {
+        int c2 = threadIdx.x + it * blockDim.x;
+        if (c2 < D2) {
+            __half2 rv = res2[c2], xv = x2[c2];
+            // 保持 residual 的 FP16 舍入边界，使用 half2 合并两路加法。
+            __half2 rounded = __hadd2(rv, xv);
+            res2[c2] = rounded;
+            cache[it * 2] = __half2float(rounded.x);
+            cache[it * 2 + 1] = __half2float(rounded.y);
+            ssq += cache[it * 2] * cache[it * 2] +
+                   cache[it * 2 + 1] * cache[it * 2 + 1];
+        } else {
+            cache[it * 2] = 0.0f;
+            cache[it * 2 + 1] = 0.0f;
+        }
+    }
+
+    __shared__ float sh[16];
+    int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        ssq += __shfl_xor_sync(0xffffffff, ssq, o);
+    if (!lane) sh[wid] = ssq;
+    __syncthreads();
+    if (!wid) {
+        ssq = lane < (blockDim.x / 32) ? sh[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1)
+            ssq += __shfl_xor_sync(0xffffffff, ssq, o);
+        if (!lane) {
+            sh[0] = __frsqrt_rn(ssq / D + 1e-6f) /
+                    fmaxf(*descale_ptr, 1e-12f);
+        }
+    }
+    __syncthreads();
+    float scale = sh[0];
+    #pragma unroll
+    for (int it = 0; it < RMS_NW_ELEMS_PER_THREAD / 2; ++it) {
+        int c2 = threadIdx.x + it * blockDim.x;
+        if (c2 < D2) {
+            auto* out2 = reinterpret_cast<__nv_fp8x2_e4m3*>(orow);
+            float2 value = make_float2(cache[it * 2] * scale,
+                                       cache[it * 2 + 1] * scale);
+            out2[c2] = __nv_fp8x2_e4m3{value};
+        }
+    }
+}
+
+// 优化：D=2048 用 128 线程复现原 8 个 warp partial，并用 FP8x2 写回。
+__global__ void res_rms_fp8_noweight_rounded_128_kernel(
+    __half* residual, const __half* x, __nv_fp8_e4m3* out,
+    const float* descale_ptr) {
+    constexpr int D = 2048;
+    int r = blockIdx.x;
+    __half2* res2 = reinterpret_cast<__half2*>(residual + r * D);
+    const __half2* x2 = reinterpret_cast<const __half2*>(x + r * D);
+    auto* out2 = reinterpret_cast<__nv_fp8x2_e4m3*>(out + r * D);
+
+    float cache[16];
+    float ssq[2] = {0.0f, 0.0f};
+    #pragma unroll
+    for (int group = 0; group < 2; ++group) {
+        int virtual_tid = threadIdx.x + group * blockDim.x;
+        #pragma unroll
+        for (int it = 0; it < 4; ++it) {
+            int c2 = virtual_tid + it * 256;
+            __half2 rounded = __hadd2(res2[c2], x2[c2]);
+            res2[c2] = rounded;
+            int ci = group * 8 + it * 2;
+            cache[ci] = __half2float(rounded.x);
+            cache[ci + 1] = __half2float(rounded.y);
+            ssq[group] += cache[ci] * cache[ci] +
+                          cache[ci + 1] * cache[ci + 1];
+        }
+    }
+
+    __shared__ float sh[8];
+    int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
+    #pragma unroll
+    for (int group = 0; group < 2; ++group) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            ssq[group] += __shfl_xor_sync(0xffffffff, ssq[group], o);
+        if (!lane) sh[wid + group * 4] = ssq[group];
+    }
+    __syncthreads();
+    float sum = lane < 8 ? sh[lane] : 0.0f;
+    #pragma unroll
+    for (int o = 4; o > 0; o >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, o);
+    float scale = 0.0f;
+    if (!lane) {
+        scale = __frsqrt_rn(sum / D + 1e-6f) /
+                fmaxf(*descale_ptr, 1e-12f);
+    }
+    scale = __shfl_sync(0xffffffff, scale, 0);
+    #pragma unroll
+    for (int group = 0; group < 2; ++group) {
+        int virtual_tid = threadIdx.x + group * blockDim.x;
+        #pragma unroll
+        for (int it = 0; it < 4; ++it) {
+            int c2 = virtual_tid + it * 256;
+            int ci = group * 8 + it * 2;
+            out2[c2] = __nv_fp8x2_e4m3{make_float2(
+                cache[ci] * scale, cache[ci + 1] * scale)};
+        }
+    }
+}
+
+void residual_add_rms_norm_fp8_noweight_rounded_fp16(
+    __half* residual, const __half* x, __nv_fp8_e4m3* out,
+    int seq_len, int dim, const float* d_scale, cudaStream_t stream) {
+    if (dim == 2048) {
+        res_rms_fp8_noweight_rounded_128_kernel<<<seq_len, 128, 0, stream>>>(
+            residual, x, out, d_scale);
+    } else {
+        res_rms_fp8_noweight_rounded_kernel<<<seq_len, 256, 0, stream>>>(
+            residual, x, out, dim, d_scale);
+    }
+}
+
 // ── BF16 noweight variants ──
 // For models with activations exceeding FP16 range (>65504).
 // BF16 residual stream can store up to 3.4e38.

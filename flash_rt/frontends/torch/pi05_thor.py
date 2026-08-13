@@ -328,11 +328,10 @@ class Pi05TorchFrontendThor:
         self.sig_HD = HD_sig
         self.sig_L = L_sig
 
-        # Per-layer weights, scales, and biases loaded declaratively above.
-        # 优化：保留现有 [K,N] 权重，并为 SigLIP FC1 epilogue 准备原生 [N,K] FP8 布局。
-        self._sig_up_w_fp8out = (
-            [w.T.contiguous() for w in self._sig_up_w]
-            if self.use_fp8 else [])
+        # 原实现从 [K,N] 再转置出一份 [N,K]；loader 现已直接加载目标布局，省去重复权重。
+        # self._sig_up_w_fp8out = (
+        #     [w.T.contiguous() for w in self._sig_up_w] if self.use_fp8 else [])
+        sig_up_w = self._sig_up_w_fp8out if self.use_fp8 else self._sig_up_w
         # Compose the pointer dict consumed by shared_primitives.siglip_forward.
         self._sig_weights = {
             'ln_attn_w': [w.data_ptr() for w in self._sig_ln_attn_w],
@@ -343,8 +342,8 @@ class Pi05TorchFrontendThor:
             'o_b':       [w.data_ptr() for w in self._sig_o_b],
             'ln_ffn_w':  [w.data_ptr() for w in self._sig_ln_ffn_w],
             'ln_ffn_b':  [w.data_ptr() for w in self._sig_ln_ffn_b],
-            'up_w':      [w.data_ptr() for w in self._sig_up_w],
-            'up_w_fp8out': [w.data_ptr() for w in self._sig_up_w_fp8out],
+            'up_w':      [] if self.use_fp8 else [w.data_ptr() for w in sig_up_w],
+            'up_w_fp8out': [w.data_ptr() for w in sig_up_w] if self.use_fp8 else [],
             'up_b':      [w.data_ptr() for w in self._sig_up_b],
             'down_w':    [w.data_ptr() for w in self._sig_down_w],
             'down_b':    [w.data_ptr() for w in self._sig_down_b],

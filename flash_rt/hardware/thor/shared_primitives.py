@@ -45,18 +45,6 @@ import math
 import os
 import numpy as np
 
-try:
-    import torch.cuda.nvtx as nvtx
-except Exception:
-    class _NvtxStub:
-        def range_push(self, _msg):
-            return None
-
-        def range_pop(self):
-            return None
-
-    nvtx = _NvtxStub()
-
 def _fa4_forward():
     from flash_rt.hardware.thor import fa4_backend
     fwd = fa4_backend.fa4_fwd()
@@ -543,55 +531,37 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             attn_result = fa4_result.data_ptr()
 
             # ── 6. Quantize attn→FP8 with act_scale + O proj GEMM ──
-            nvtx.range_push(f"step6_enc_l{l}_attn_quant_o_proj")
-            try:
-                fvk.quantize_fp8_static_fp16(attn_result, o_fp8, as_o, Se * D, stream)
-                fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
-                                   Se, D, D, alpha_host[l * 4 + 1], 0.0, stream)
-            finally:
-                nvtx.range_pop()
+            fvk.quantize_fp8_static_fp16(attn_result, o_fp8, as_o, Se * D, stream)
+            fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
+                               Se, D, D, alpha_host[l * 4 + 1], 0.0, stream)
 
             # ── 7. Residual + RMSNorm → FP8 with act_scale (noweight) ──
-            nvtx.range_push(f"step7_enc_l{l}_res_rms_1")
-            try:
-                fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
-                                                              Se, D, as_gu, stream)
-            finally:
-                nvtx.range_pop()
+            fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
+                                                          Se, D, as_gu, stream)
 
             # ── 8+9. Gate/Up GEMM + GEGLU ──
-            nvtx.range_push(f"step8_enc_l{l}_ffn_gate_up")
-            try:
-                # fvk.cutlass_fp8_wide(x_fp8, weights['gate_w'][l], gate,
-                #                       Se, H * 2, D, alpha_host[l * 4 + 2], 0.0, stream)
-                # fvk.gate_geglu_merged_fp8_fp16(gate, hid_fp8, Se, H, as_d, stream)
-                # 优化：拆分 Gate/Up，在 Up GEMM epilogue 融合 GEGLU 与 FP8 量化。
-                # 消除独立 step9 kernel 和 Up FP16 中间结果读写。
-                gate_w = weights['gate_w'][l]
-                up_w = gate_w + H * D
-                fvk.cutlass_fp8_wide(x_fp8, gate_w, gate,
-                                      Se, H, D, alpha_host[l * 4 + 2], 0.0, stream)
-                fvk.cutlass_fp8_wide_geglu_fp8out(x_fp8, up_w, gate, hid_fp8,
-                                                   Se, H, D, alpha_host[l * 4 + 2],
-                                                   as_d, stream)
-            finally:
-                nvtx.range_pop()
+            # fvk.cutlass_fp8_wide(x_fp8, weights['gate_w'][l], gate,
+            #                       Se, H * 2, D, alpha_host[l * 4 + 2], 0.0, stream)
+            # fvk.gate_geglu_merged_fp8_fp16(gate, hid_fp8, Se, H, as_d, stream)
+            # 优化：拆分 Gate/Up，在 Up GEMM epilogue 融合 GEGLU 与 FP8 量化。
+            # 消除独立 step9 kernel 和 Up FP16 中间结果读写。
+            gate_w = weights['gate_w'][l]
+            up_w = gate_w + H * D
+            fvk.cutlass_fp8_wide(x_fp8, gate_w, gate,
+                                  Se, H, D, alpha_host[l * 4 + 2], 0.0, stream)
+            fvk.cutlass_fp8_wide_geglu_fp8out(x_fp8, up_w, gate, hid_fp8,
+                                               Se, H, D, alpha_host[l * 4 + 2],
+                                               as_d, stream)
 
             # ── 10. Down GEMM ──
-            nvtx.range_push(f"step10_enc_l{l}_ffn_down")
-            try:
-                fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
-                                      Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
-            finally:
-                nvtx.range_pop()
+            fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
+                                  Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
 
-            # ── 11. Residual writeback. The next layer recomputes C1
-            # RMSNorm→FP8, so no FP8 output is consumed here.
-            nvtx.range_push(f"step11_enc_l{l}_residual_writeback")
-            try:
-                fvk.residual_add_fp16(x, fg, Se * D, stream)
-            finally:
-                nvtx.range_pop()
+            # 候选融合仅保留记录：收益约 0.1 ms，暂不作为默认路径。
+            # fvk.residual_add_rms_norm_fp8_noweight_rounded_fp16(
+            #     x, fg, x_fp8, Se, D,
+            #     act_scales + ((l + 1) * 4) * 4, stream)
+            fvk.residual_add_fp16(x, fg, Se * D, stream)
 
     # x[Se, D] now contains final encoder output
 
