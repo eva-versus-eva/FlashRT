@@ -2717,14 +2717,96 @@ __global__ void quantize_int8_rowwise_kernel(
     }
 }
 
+union BFloat16x4 {
+    uint64_t packed;
+    __nv_bfloat162 pairs[2];
+};
+
+__device__ __forceinline__ float4 load_bf16x4(const uint64_t* input, int index) {
+    BFloat16x4 value;
+    value.packed = input[index];
+    float2 lo = __bfloat1622float2(value.pairs[0]);
+    float2 hi = __bfloat1622float2(value.pairs[1]);
+    return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
+__device__ __forceinline__ float max_abs(float4 value) {
+    return fmaxf(
+        fmaxf(fabsf(value.x), fabsf(value.y)),
+        fmaxf(fabsf(value.z), fabsf(value.w)));
+}
+
+__device__ __forceinline__ int8_t quantize_int8(float value, float inv_scale) {
+    int quantized = __float2int_rn(value * inv_scale);
+    return static_cast<int8_t>(max(-127, min(127, quantized)));
+}
+
+__global__ void quantize_int8_rowwise_bf16x4_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const uint64_t* in4 = reinterpret_cast<const uint64_t*>(
+        input + static_cast<size_t>(row) * cols);
+    char4* out4 = reinterpret_cast<char4*>(
+        output + static_cast<size_t>(row) * cols);
+    int cols4 = cols >> 2;
+
+    float local_amax = 0.0f;
+    for (int index = threadIdx.x; index < cols4; index += blockDim.x) {
+        local_amax = fmaxf(local_amax, max_abs(load_bf16x4(in4, index)));
+    }
+
+    extern __shared__ float shared[];
+    float amax = block_reduce_max(local_amax, shared);
+    if (threadIdx.x == 0) {
+        float scale = fmaxf(amax / 127.0f, 1e-10f);
+        scales[row] = scale;
+        shared[0] = 1.0f / scale;
+    }
+    __syncthreads();
+
+    float inv_scale = shared[0];
+    for (int index = threadIdx.x; index < cols4; index += blockDim.x) {
+        float4 value = load_bf16x4(in4, index);
+        out4[index] = make_char4(
+            quantize_int8(value.x, inv_scale),
+            quantize_int8(value.y, inv_scale),
+            quantize_int8(value.z, inv_scale),
+            quantize_int8(value.w, inv_scale));
+    }
+}
+
+static bool can_vectorize_int8_rowwise(
+    const __nv_bfloat16* input, const int8_t* output, int cols) {
+    return cols >= 4 && cols % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(input) % alignof(uint64_t) == 0 &&
+        reinterpret_cast<uintptr_t>(output) % alignof(char4) == 0;
+}
+
 void quantize_int8_rowwise(const __nv_bfloat16* input, int8_t* output,
                            float* d_scales, int rows, int cols,
                            cudaStream_t stream) {
     int threads = (cols < 256) ? cols : 256;
     threads = ((threads + 31) / 32) * 32;
     if (threads < 32) threads = 32;
+    /*
     quantize_int8_rowwise_kernel<<<rows, threads, 0, stream>>>(
         input, output, d_scales, rows, cols);
+    */
+    // 优化：满足连续 4 元素对齐时使用 64-bit BF16 读取和 32-bit INT8 写入。
+    if (can_vectorize_int8_rowwise(input, output, cols)) {
+        int smem = (threads >> 5) * sizeof(float);
+        quantize_int8_rowwise_bf16x4_kernel<<<rows, threads, smem, stream>>>(
+            input, output, d_scales, rows, cols);
+    } else {
+        quantize_int8_rowwise_kernel<<<rows, threads, 0, stream>>>(
+            input, output, d_scales, rows, cols);
+    }
 }
 
 // ── Static per-row INT8 quantization (pre-calibrated scales, single-pass) ──

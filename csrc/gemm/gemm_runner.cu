@@ -1,4 +1,5 @@
 #include "gemm_runner.h"
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -218,6 +219,17 @@ void GemmRunner::autotune_cached(CachedGemm& entry, void* A, void* B, void* D,
 void GemmRunner::autotune_bf16_nn(void* A, void* B, void* D,
                                    int M, int N, int K, int num_algos) {
     auto& entry = get_or_create_cached(BF16_NN, M, N, K);
+    const char* stable_tactics = std::getenv("FVK_BF16_GEMM_STABLE_TACTICS");
+    const bool unstable_shape =
+        (M == 512 && N == 1152 && K == 588) ||
+        (N == 2048 && K == 2048) ||
+        (M == 10 && N == 2560 && K == 1024);
+    // Orin 上这三种 shape 的微基准候选会跨进程抖动；固定 cuBLASLt heuristic top-1。
+    if (stable_tactics != nullptr && stable_tactics[0] == '1' && unstable_shape) {
+        std::cout << "  autotune: BF16 stable heuristic top-1 for ("
+                  << M << ", " << N << ", " << K << ")" << std::endl;
+        return;
+    }
     autotune_cached(entry, A, B, D, 1.0f, 0.0f, num_algos);
 }
 
