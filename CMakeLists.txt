@@ -370,6 +370,24 @@ if(ENABLE_SM100_CUTLASS)
     >
   )
 
+  add_library(flashrt_megakernel_geglu_fp8_obj OBJECT csrc/gemm/mega/flashrt_megakernel_geglu_fp8.cu)
+  set_target_properties(flashrt_megakernel_geglu_fp8_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(flashrt_megakernel_geglu_fp8_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/mega
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(flashrt_megakernel_geglu_fp8_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
   # Encoder GeGLU + down-proj megakernel: bundles the GeGLU megakernel and
   # the down GEMM (beta=1 residual) into one C entry.  Uses the same
   # include precedence as the GeGLU object (mega dir before upstream CUTLASS).
@@ -1561,6 +1579,7 @@ if(ENABLE_SM100_CUTLASS)
     $<TARGET_OBJECTS:cutlass_sm100_fp16_obj>
     $<TARGET_OBJECTS:flashrt_megakernel_obj>
     $<TARGET_OBJECTS:flashrt_megakernel_geglu_obj>
+    $<TARGET_OBJECTS:flashrt_megakernel_geglu_fp8_obj>
     $<TARGET_OBJECTS:flashrt_megakernel_geglu_g8_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
   if(FLASHRT_BUILD_SM100_SWEEP)

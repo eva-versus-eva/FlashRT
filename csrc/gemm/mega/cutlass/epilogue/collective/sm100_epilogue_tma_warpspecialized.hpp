@@ -59,6 +59,14 @@ namespace cutlass::epilogue::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <class Operation, class = void>
+struct FlashRtSkipGlobalStore : cute::false_type {};
+
+template <class Operation>
+struct FlashRtSkipGlobalStore<Operation,
+    cute::void_t<decltype(Operation::kSkipGlobalStore)>>
+    : cute::bool_constant<Operation::kSkipGlobalStore> {};
+
 template <
   int StagesC_,
   int StagesD_,
@@ -121,6 +129,7 @@ public:
   using CopyOpR2R = CopyOpR2R_;
 
   using ThreadEpilogueOp = typename epilogue::fusion::FusionCallbacksTraits<FusionCallbacks>::Operation;
+  constexpr static bool SkipGlobalStore = FlashRtSkipGlobalStore<ThreadEpilogueOp>::value;
   using GmemTiledCopyC = CopyOpG2S;
   using GmemTiledCopyD = CopyOpS2G;
 
@@ -769,22 +778,28 @@ public:
         // Write the tile from smem to gmem with TMA
         cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
         synchronize(); // ensure all threads have issued their async fence
-        if (issue_tma_store) {
-          copy(params.tma_store_d, bSG_sD(_,_,_,store_pipe_producer_state.index()), bSG_gD(_,_,_,epi_m,epi_n));
+        if constexpr (not SkipGlobalStore) {
+          if (issue_tma_store) {
+            copy(params.tma_store_d, bSG_sD(_,_,_,store_pipe_producer_state.index()), bSG_gD(_,_,_,epi_m,epi_n));
+          }
         }
 
         // Post async fence, pre TMA commit callback entry point
         cst_callbacks.tma_store(epi_m, epi_n, store_pipe_producer_state.count(), issue_tma_store);
 
         // Commit the TMA stores for this stage
-        if (issue_tma_store) {
-          store_pipeline.producer_commit(store_pipe_producer_state);
+        if constexpr (not SkipGlobalStore) {
+          if (issue_tma_store) {
+            store_pipeline.producer_commit(store_pipe_producer_state);
+          }
+          ++store_pipe_producer_state;
         }
-        ++store_pipe_producer_state;
 
         // Wait for the next smem buffer to be available
-        if (issue_tma_store) {
-          store_pipeline.producer_acquire(store_pipe_producer_state);
+        if constexpr (not SkipGlobalStore) {
+          if (issue_tma_store) {
+            store_pipeline.producer_acquire(store_pipe_producer_state);
+          }
         }
         synchronize();
 

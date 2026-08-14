@@ -303,7 +303,8 @@ template<
   class ElementSource_ = ElementOutput_,
   class ElementScalar_ = ElementCompute_,
   int AlignmentAux_ = 128 / cute::sizeof_bits_v<ElementAux_>,
-  cutlass::FloatRoundStyle RoundStyle_ = cutlass::FloatRoundStyle::round_to_nearest
+  cutlass::FloatRoundStyle RoundStyle_ = cutlass::FloatRoundStyle::round_to_nearest,
+  bool SkipGlobalStore_ = false
 >
 struct LinCombEltActSmemAuxStore
     : LinCombEltAct<ActivationFn_, ElementOutput_, ElementCompute_, ElementSource_, ElementScalar_, RoundStyle_> {
@@ -312,6 +313,7 @@ struct LinCombEltActSmemAuxStore
   static constexpr int AlignmentAux = AlignmentAux_;
   static constexpr bool IsAuxOutSupported = true;
   static constexpr bool IsAuxInSupported  = false;
+  static constexpr bool kSkipGlobalStore = SkipGlobalStore_;
 };
 
 template<
@@ -386,7 +388,7 @@ template <
   template <class> class ActivationFn,
   class ElementOutput, class ElementCompute,
   class ElementAux, class ElementSource, class ElementScalar,
-  int AlignmentAux, cutlass::FloatRoundStyle RoundStyle,
+  int AlignmentAux, cutlass::FloatRoundStyle RoundStyle, bool SkipGlobalStore,
   class CtaTileShapeMNK, class EpilogueTile,
   class SmemLayoutAtom, class CopyOpR2S
 >
@@ -394,7 +396,8 @@ struct FusionCallbacks<
     cutlass::epilogue::Sm90TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
     flashrt::megakernel::fusion::LinCombEltActSmemAuxStore<
         ActivationFn, ElementOutput, ElementCompute,
-        ElementAux, ElementSource, ElementScalar, AlignmentAux, RoundStyle>,
+        ElementAux, ElementSource, ElementScalar, AlignmentAux, RoundStyle,
+        SkipGlobalStore>,
     CtaTileShapeMNK, EpilogueTile,
     SmemLayoutAtom, CopyOpR2S
 > : flashrt::megakernel::fusion::Sm100LinCombEltActSmemAuxStoreTree<
@@ -413,7 +416,8 @@ struct FusionCallbacks<
 
   using Operation = flashrt::megakernel::fusion::LinCombEltActSmemAuxStore<
       ActivationFn, ElementOutput, ElementCompute,
-      ElementAux, ElementSource, ElementScalar, AlignmentAux, RoundStyle>;
+      ElementAux, ElementSource, ElementScalar, AlignmentAux, RoundStyle,
+      SkipGlobalStore>;
 
   struct Arguments {
     ElementScalar alpha = ElementScalar(1);

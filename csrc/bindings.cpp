@@ -451,6 +451,9 @@ extern "C" int flashrt_megakernel_geglu_fp16(void*, void*, void*,
                                               void*, void*,
                                               int, int, int,
                                               cudaStream_t);
+extern "C" int flashrt_megakernel_geglu_fp8(void*, void*, void*, void*, void*,
+                                             int, int, int, float, const float*,
+                                             cudaStream_t);
 // Fused encoder GeGLU + down-proj with residual.
 // Args: (X, W_gate, W_up, W_down, hidden_scratch, x_inout, M, H, D, stream).
 // Computes x_inout += GeGLU(X @ W_gate, X @ W_up) @ W_down, bundling the
@@ -2148,6 +2151,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
           py::arg("D_gate_scratch"), py::arg("hidden"),
           py::arg("M"), py::arg("N"), py::arg("K"),
           py::arg("stream") = 0);
+
+    m.def("flashrt_megakernel_geglu_fp8",
+          [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up,
+             uintptr_t gate_scratch, uintptr_t hidden,
+             int M, int N, int K, float alpha,
+             uintptr_t act_scale, uintptr_t stream) {
+              return flashrt_megakernel_geglu_fp8(
+                  to_ptr(X), to_ptr(W_gate), to_ptr(W_up),
+                  to_ptr(gate_scratch), to_ptr(hidden), M, N, K, alpha,
+                  reinterpret_cast<const float*>(act_scale), to_stream(stream));
+          },
+          py::arg("X"), py::arg("W_gate"), py::arg("W_up"),
+          py::arg("gate_scratch"), py::arg("hidden"),
+          py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),
+          py::arg("act_scale"), py::arg("stream") = 0);
 
     // Fused GeGLU + down-proj with residual: the GeGLU megakernel and the
     // down GEMM (beta=1) are bundled inside one .cu entry (two launches).

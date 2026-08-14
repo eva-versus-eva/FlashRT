@@ -540,28 +540,27 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
                                                           Se, D, as_gu, stream)
 
             # ── 8+9. Gate/Up GEMM + GEGLU ──
-            # fvk.cutlass_fp8_wide(x_fp8, weights['gate_w'][l], gate,
-            #                       Se, H * 2, D, alpha_host[l * 4 + 2], 0.0, stream)
-            # fvk.gate_geglu_merged_fp8_fp16(gate, hid_fp8, Se, H, as_d, stream)
-            # 优化：拆分 Gate/Up，在 Up GEMM epilogue 融合 GEGLU 与 FP8 量化。
-            # 消除独立 step9 kernel 和 Up FP16 中间结果读写。
             gate_w = weights['gate_w'][l]
             up_w = gate_w + H * D
-            fvk.cutlass_fp8_wide(x_fp8, gate_w, gate,
-                                  Se, H, D, alpha_host[l * 4 + 2], 0.0, stream)
-            fvk.cutlass_fp8_wide_geglu_fp8out(x_fp8, up_w, gate, hid_fp8,
-                                               Se, H, D, alpha_host[l * 4 + 2],
-                                               as_d, stream)
+            # 优化：two-phase kernel 复用 X tile，并用 SMEM 传递 FP16 gate。
+            # fvk.cutlass_fp8_wide(x_fp8, gate_w, gate,
+            #                       Se, H, D, alpha_host[l * 4 + 2], 0.0, stream)
+            # fvk.cutlass_fp8_wide_geglu_fp8out(x_fp8, up_w, gate, hid_fp8,
+            #                                    Se, H, D, alpha_host[l * 4 + 2],
+            #                                    as_d, stream)
+            fvk.flashrt_megakernel_geglu_fp8(
+                x_fp8, gate_w, up_w, gate, hid_fp8, Se, H, D,
+                alpha_host[l * 4 + 2], as_d, stream)
 
             # ── 10. Down GEMM ──
             fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
                                   Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
 
-            # 候选融合仅保留记录：收益约 0.1 ms，暂不作为默认路径。
+            fvk.residual_add_fp16(x, fg, Se * D, stream)
+            # 候选融合保留为注释：局部更快，但端到端收益无法稳定区分。
             # fvk.residual_add_rms_norm_fp8_noweight_rounded_fp16(
             #     x, fg, x_fp8, Se, D,
             #     act_scales + ((l + 1) * 4) * 4, stream)
-            fvk.residual_add_fp16(x, fg, Se * D, stream)
 
     # x[Se, D] now contains final encoder output
 
